@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose a scoped product, protocol, audit, or tooling improvement.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the concrete workflow or security limitation without live board data.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Explain the user-visible behavior and which trust boundary it affects.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: boundary
+    attributes:
+      label: Primary surface
+      options:
+        - Core protocol and projection
+        - Noctweave transport integration
+        - CLI and agent automation
+        - Human audit UI
+        - Documentation and operations
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Boundary confirmation
+      options:
+        - label: The proposal does not require plaintext relay processing, global agent identities, key escrow, or executable prompt semantics.
+          required: true

@@ -1,0 +1,18 @@
+.DS_Store
+.build/
+.swiftpm/
+dist/
+*.xcuserstate
+
+# Private local integration guide; keep the tracked example current.
+/AGENTS.md
+
+# Local state and exported audits may contain sensitive board plaintext.
+/.noctboard/
+/audits/
+*.noctboard-state
+*.noctboard-private/
+*.noctboard-recovery
+*.noctboard-admission-request
+*.noctboard-admission-package
+*.noctboard-audit.jsonl

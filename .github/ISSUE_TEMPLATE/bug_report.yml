@@ -1,0 +1,52 @@
+name: Bug report
+description: Report a reproducible Noct Board defect using synthetic, redacted data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not submit vulnerabilities or live board material here. Use the private security-reporting link instead.
+
+  - type: input
+    id: revision
+    attributes:
+      label: Noct Board revision
+      description: Commit SHA or evaluation snapshot name.
+      placeholder: 40-character commit SHA
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS version, Apple silicon model, Swift version, and relay transport.
+      placeholder: macOS 14.7, Apple M2, Swift 6.0, loopback TCP
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Reproduction and observed behavior
+      description: Use synthetic identifiers and text. Include the smallest repeatable sequence and the expected result.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Optional. Remove board text, member handles, keys, route capabilities, passwords, state, and audit exports.
+      render: shell
+
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I used only synthetic or fully redacted data and included no security-sensitive material.
+          required: true
+        - label: This is not a vulnerability report.
+          required: true

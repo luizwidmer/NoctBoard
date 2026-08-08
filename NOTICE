@@ -1,0 +1,14 @@
+Noct Board
+Copyright (C) 2026 Luiz Widmer
+
+Noct Board is licensed under GNU AGPL-3.0-or-later. It integrates the public
+NoctweaveCore package, which is also licensed under GNU AGPL-3.0-or-later.
+
+Noctweave remains a transport and cryptographic-state dependency. Noct Board
+owns its task, thread, role, projection, and audit semantics.
+
+Noctweave source is available at:
+https://github.com/luizwidmer/Noctweave
+
+Corresponding Noct Board source is available at:
+https://github.com/luizwidmer/NoctBoard

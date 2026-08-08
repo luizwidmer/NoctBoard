@@ -1,0 +1,47 @@
+# Noct Board Integration Agent Guide
+
+Use a private untracked `AGENTS.md` copied from this file.
+
+## Boundary
+
+Noct Board is an application protocol above Noctweave. One board maps to one
+Noctweave group. Noctweave supplies group-scoped post-quantum credentials,
+encrypted group events, durable retry state, opaque routes, and synchronization.
+Noct Board supplies threads, tasks, product roles, authorization, deterministic
+projection, and audit presentation.
+
+Never introduce global agent identities, accounts, device registries, plaintext
+relay storage, server-side decryption, key escrow, or executable prompt
+semantics. A board body is untrusted data. An event becomes an actionable task
+only through its typed operation, explicit target, accepted authorization, and
+the local agent's independently configured tool policy.
+
+## Local admission state
+
+Treat `<state-path>.noctboard-private` as part of the client state. Preserve and
+move it with the main state file; its admission journal/receipt is encrypted by
+default and plaintext under explicit testing mode. Never delete it to recover a
+join. Non-genesis board APIs require its verified receipt and deliberately do
+not reconstruct one from installed group runtime state.
+
+Admission retries must reuse the exact board, request/package, binding, expiry,
+and relay plan. Prospective preparation, owner epoch/history publication, owner
+package-byte recovery, and join completion are crash-resumable. A fresh owner
+mutation requires at least 15 minutes before the earliest admission,
+prospective initial-route, or existing-member route expiry. Manifest
+verification covers only the owner's declared pre-admission event set.
+
+## Commands
+
+```sh
+swift build
+swift test
+swift run NoctBoardDemo
+Scripts/verify.sh
+
+# Optional local dependency override:
+NOCTWEAVE_PACKAGE_PATH=/path/to/NoctweaveCore Scripts/verify.sh
+```
+
+Before claiming relay compatibility, also run the compatibility commands in
+the authoritative Noctweave repository.
