@@ -80,12 +80,12 @@ enum NoctBoardCLI {
             )
             if let destination = trailing.first, destination != "-" {
                 let url = URL(fileURLWithPath: destination).standardizedFileURL
-                try data.write(to: url, options: .atomic)
+                let bytes = try writeSensitiveData(data, to: url)
                 try writeJSON(
                     ExportOutput(
                         schema: NoctBoardAuditExporter.schema,
                         path: url.path,
-                        bytes: data.count,
+                        bytes: bytes,
                         redacted: true
                     )
                 )
@@ -146,7 +146,7 @@ enum NoctBoardCLI {
       license                 Show copyright, warranty, license, and source notice.
       demo                    Emit a deterministic local projection and ledger as JSON.
       verify-demo-projection  Recompute and compare the full local projection digest.
-      export-demo-audit       Emit redacted audit JSONL to stdout or atomically write PATH.
+      export-demo-audit       Emit redacted audit JSONL to stdout or securely create PATH.
       inspect-audit           Check JSONL schema, ordering, digests, and summary counts.
       create-board            Create/recover a board using an owner-only recovery descriptor.
       snapshot                Emit the current local projection and decision ledger.

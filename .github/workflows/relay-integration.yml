@@ -1,0 +1,46 @@
+name: Relay integration
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-integration-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  full-relay:
+    name: Full post-quantum relay suite
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      NOCTBOARD_RUN_RELAY_INTEGRATION: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Confirm supported toolchain and architecture
+        run: |
+          swift --version
+          test "$(uname -m)" = "arm64"
+
+      - name: Resolve the pinned dependency graph
+        run: |
+          swift package --scratch-path "$RUNNER_TEMP/noctboard-release-build" resolve
+          git diff --exit-code -- Package.resolved
+
+      - name: Run full release-configuration tests
+        run: swift test -c release --scratch-path "$RUNNER_TEMP/noctboard-release-build"
+
+      - name: Run release demo
+        run: swift run -c release --scratch-path "$RUNNER_TEMP/noctboard-release-build" NoctBoardDemo
+
+      - name: Check patch hygiene
+        run: git diff --check
