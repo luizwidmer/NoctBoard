@@ -8,6 +8,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 public enum NoctBoardAuditSource: Equatable, Sendable {
+    case unopened
     case deterministicFixture
     case liveLocal(
         boardID: UUID,
@@ -29,7 +30,7 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var isImportingAudit = false
     @Published public private(set) var isLoadingLiveBoard = false
-    @Published public private(set) var source: NoctBoardAuditSource = .deterministicFixture
+    @Published public private(set) var source: NoctBoardAuditSource = .unopened
     @Published public private(set) var containerRejections: [NoctBoardContainerRejection] = []
     @Published public private(set) var historyBootstrapProvenance: [
         NoctBoardHistoryBootstrapProvenance
@@ -38,9 +39,10 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
     private var liveClient: NoctBoardClient?
     private var securityScopedStateURL: URL?
 
-    public init() {
-        // The standalone evaluation app intentionally does not open live client state.
-        loadDeterministicDemo()
+    public init(loadEvaluationFixture: Bool = false) {
+        if loadEvaluationFixture {
+            loadDeterministicDemo()
+        }
     }
 
     public func loadDeterministicDemo() {
@@ -221,8 +223,12 @@ public struct NoctBoardAuditConsole: View {
     @State private var showingImporter = false
     @State private var showingLiveBoardOpen = false
 
-    public init() {
-        _model = StateObject(wrappedValue: NoctBoardAuditConsoleModel())
+    public init(loadEvaluationFixture: Bool = false) {
+        _model = StateObject(
+            wrappedValue: NoctBoardAuditConsoleModel(
+                loadEvaluationFixture: loadEvaluationFixture
+            )
+        )
     }
 
     public var body: some View {
@@ -230,7 +236,8 @@ public struct NoctBoardAuditConsole: View {
             List(Section.allCases, selection: $selection) { section in
                 Label(section.rawValue, systemImage: section.icon).tag(section)
             }
-            .navigationTitle("NoctBoard Eval")
+            .navigationTitle("NoctBoard")
+            .navigationSplitViewColumnWidth(min: 210, ideal: 230, max: 280)
             .safeAreaInset(edge: .bottom) {
                 VStack(alignment: .leading, spacing: 10) {
                     Button {
@@ -324,6 +331,12 @@ public struct NoctBoardAuditConsole: View {
                 systemImage: "exclamationmark.triangle",
                 description: Text(error)
             )
+        } else if selection == .importedAudit {
+            if model.isImportingAudit {
+                ProgressView("Reading bounded audit file…")
+            } else {
+                ImportedAuditView(audit: model.importedAudit)
+            }
         } else if let result = model.result {
             VStack(spacing: 0) {
                 if !model.historyBootstrapProvenance.isEmpty {
@@ -346,15 +359,17 @@ public struct NoctBoardAuditConsole: View {
                     historyBootstrapProvenance: model.historyBootstrapProvenance
                 )
                 case .importedAudit:
-                    if model.isImportingAudit {
-                        ProgressView("Reading bounded audit file…")
-                    } else {
-                        ImportedAuditView(audit: model.importedAudit)
-                    }
+                    EmptyView()
                 }
             }
         } else {
-            ProgressView("Building local projection…")
+            ContentUnavailableView(
+                "No board opened",
+                systemImage: "lock.open.display",
+                description: Text(
+                    "Open an authorized encrypted client-state file or inspect a redacted audit JSONL export. No fixture data is loaded automatically."
+                )
+            )
         }
     }
 }
@@ -507,7 +522,13 @@ private struct OverviewView: View {
                         .foregroundStyle(.green)
                 }
 
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 210), spacing: 12)], spacing: 12) {
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(), spacing: 12),
+                        GridItem(.flexible(), spacing: 12),
+                    ],
+                    spacing: 12
+                ) {
                     StatusCard(
                         title: source.isLiveLocal
                             ? "Live board/group bound"
@@ -585,6 +606,7 @@ private struct OverviewView: View {
 
     private var sourceTitle: String {
         switch source {
+        case .unopened: "No board opened"
         case .deterministicFixture: "Deterministic evaluation fixture"
         case .liveLocal: "Locally verified retained group state"
         }
@@ -592,6 +614,8 @@ private struct OverviewView: View {
 
     private var sourceSubtitle: String {
         switch source {
+        case .unopened:
+            "No local board state has been selected."
         case .deterministicFixture:
             "Fixed demo data, not live encrypted Noctweave state"
         case .liveLocal(let boardID, let epoch, let eventCount, _):
@@ -605,6 +629,8 @@ private struct OverviewView: View {
 
     private var sourceBindingDetail: String {
         switch source {
+        case .unopened:
+            "Open an authorized encrypted client-state file to verify its board/group binding."
         case .deterministicFixture:
             "The v1 fixture uses one UUID for both board and Noctweave group."
         case .liveLocal(let boardID, _, _, _):

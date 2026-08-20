@@ -9,6 +9,15 @@ import XCTest
 @testable import NoctBoardUI
 
 final class NoctBoardAuditSurfaceTests: XCTestCase {
+    @MainActor
+    func testAuditConsoleStartsWithoutFixtureData() {
+        let model = NoctBoardAuditConsoleModel()
+
+        XCTAssertEqual(model.source, .unopened)
+        XCTAssertNil(model.result)
+        XCTAssertNil(model.importedAudit)
+    }
+
     func testImporterAcceptsExactAuditWithContainerAndHistoryEvidence() throws {
         let fixture = try makeFixture()
         let data = try NoctBoardAuditExporter.jsonLines(

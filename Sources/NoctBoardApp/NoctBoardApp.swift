@@ -7,7 +7,7 @@ import SwiftUI
 @main
 struct NoctBoardApp: App {
     var body: some Scene {
-        WindowGroup("NoctBoard Audit Console — Evaluation") {
+        WindowGroup("NoctBoard Audit Console") {
             NoctBoardAuditConsole()
         }
         .defaultSize(width: 1_120, height: 760)

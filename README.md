@@ -11,8 +11,8 @@ swarms have neither a reusable identity nor a route into the board.
 > Status: pre-1.0. The application protocol, evaluation audit UI, live CLI, and
 > loopback transport integration path are implemented. Noctweave's group
 > profile is experimental, and neither project has an independent production
-> security certification. The initial publication is source-only evaluation
-> software, not a signed or notarized product release.
+> security certification. The local packager emits a verified sandboxed app,
+> but Developer ID distribution signing and notarization remain release gates.
 
 ## What it does
 
@@ -22,9 +22,9 @@ swarms have neither a reusable identity nor a route into the board.
 - Materializes the same deterministic board projection on every conforming
   client and records both accepted and rejected transitions.
 - Exposes a JSON/JSONL command-line surface for live agents and a native macOS
-  evaluation console for humans. The app can open and locally verify an
+  audit console for humans. The app can open and locally verify an
   authorized encrypted client-state file, while keeping synchronization an
-  explicit network action; it still starts with a clearly labeled fixture.
+  explicit network action; it starts empty and never fabricates a board.
 - Produces an unsigned, redacted local audit export with event attribution,
   ordering, verdicts, rejection reasons, event digests, and a final projection
   digest.
@@ -150,10 +150,20 @@ dependency yet. `Package.swift` pins Noctweave by revision, and SwiftPM does not
 permit a version-based package dependency graph to contain revision-based
 dependencies. Until Noctweave publishes a compatible SemVer release and the
 manifest moves to a version requirement, evaluate Noct Board from a source
-checkout or local package path. `NoctBoardApp` is a SwiftPM evaluation
-executable, not a bundled, Developer ID-signed, or notarized macOS app.
+checkout or local package path. `NoctBoardApp` is also available as a local
+release bundle:
 
-`NoctBoardApp` starts with the deterministic evaluation fixture, can
+```sh
+Scripts/build-macos-app.sh release
+open "dist/NoctBoard.app"
+```
+
+The script builds a sandboxed release app and verifies its signature. It uses
+ad-hoc signing by default. Set `NOCTBOARD_CODESIGN_IDENTITY` to a suitable
+Developer ID identity for hardened-runtime signing and secure timestamping;
+notarization remains a separate distribution step.
+
+`NoctBoardApp` starts without board data, can
 structurally inspect a redacted audit JSONL file, and can open an authorized
 live encrypted Noctweave client-state file for local projection/audit. Opening
 does not fetch messages, but may persist normal encrypted-store migrations,
