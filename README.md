@@ -121,7 +121,7 @@ Requirements: Swift 6, macOS 14 or later, and Apple silicon (`arm64`). The
 pinned Noctweave dependency currently supplies `liboqs.xcframework` only for
 `macos-arm64`; Intel and universal builds are not supported. The default
 package dependency is the inspected public Noctweave revision
-`41a874fc68dc87898f7406b23d290b308364442b`. For development against a local
+`f8351b0412ec7f46c8fd18b4a5034d7a72f18d8f`. For development against a local
 checkout:
 
 ```sh
