@@ -219,7 +219,7 @@ public struct NoctBoardAuditConsole: View {
     }
 
     @StateObject private var model: NoctBoardAuditConsoleModel
-    @State private var selection: Section? = .overview
+    @State private var selection: Section?
     @State private var showingImporter = false
     @State private var showingLiveBoardOpen = false
 
@@ -229,54 +229,16 @@ public struct NoctBoardAuditConsole: View {
                 loadEvaluationFixture: loadEvaluationFixture
             )
         )
+        _selection = State(initialValue: loadEvaluationFixture ? .overview : nil)
     }
 
     public var body: some View {
-        NavigationSplitView {
-            List(Section.allCases, selection: $selection) { section in
-                Label(section.rawValue, systemImage: section.icon).tag(section)
+        Group {
+            if hasOpenedSource {
+                auditWorkspace
+            } else {
+                sourceChooser
             }
-            .navigationTitle("NoctBoard")
-            .navigationSplitViewColumnWidth(min: 210, ideal: 230, max: 280)
-            .safeAreaInset(edge: .bottom) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Button {
-                        showingLiveBoardOpen = true
-                    } label: {
-                        Label("Open Live Board", systemImage: "lock.open.display")
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    Button {
-                        showingImporter = true
-                    } label: {
-                        Label("Open Audit JSONL", systemImage: "folder")
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .buttonStyle(.plain)
-                .padding()
-            }
-        } detail: {
-            detail
-                .navigationTitle(selection?.rawValue ?? "NoctBoard")
-                .toolbar {
-                    Button {
-                        showingLiveBoardOpen = true
-                    } label: {
-                        Label("Open Live Board", systemImage: "lock.open.display")
-                    }
-                    Button {
-                        model.synchronizeLiveBoard()
-                    } label: {
-                        Label("Sync Encrypted Board", systemImage: "arrow.triangle.2.circlepath")
-                    }
-                    .disabled(!model.source.isLiveLocal || model.isLoadingLiveBoard)
-                    Button {
-                        showingImporter = true
-                    } label: {
-                        Label("Open Audit", systemImage: "doc.badge.plus")
-                    }
-                }
         }
         .sheet(isPresented: $showingLiveBoardOpen) {
             LiveBoardOpenSheet { request in
@@ -323,6 +285,97 @@ public struct NoctBoardAuditConsole: View {
         .frame(minWidth: 960, minHeight: 640)
     }
 
+    private var auditWorkspace: some View {
+        NavigationSplitView {
+            List(availableSections, selection: $selection) { section in
+                Label(section.rawValue, systemImage: section.icon).tag(section)
+            }
+            .navigationTitle("NoctBoard")
+            .navigationSplitViewColumnWidth(min: 210, ideal: 230, max: 280)
+        } detail: {
+            detail
+                .navigationTitle(selection?.rawValue ?? "NoctBoard")
+                .toolbar {
+                    if model.source.isLiveLocal {
+                        Button {
+                            model.synchronizeLiveBoard()
+                        } label: {
+                            Label("Sync Encrypted Board", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .disabled(model.isLoadingLiveBoard)
+                    }
+                    Menu {
+                        Button("Open Live Board", systemImage: "lock.open.display") {
+                            showingLiveBoardOpen = true
+                        }
+                        Button("Inspect Audit Export", systemImage: "doc.text.magnifyingglass") {
+                            showingImporter = true
+                        }
+                    } label: {
+                        Label("Open", systemImage: "folder")
+                    }
+                }
+        }
+    }
+
+    private var sourceChooser: some View {
+        NavigationStack {
+            VStack(spacing: 22) {
+                Image(systemName: "checkmark.shield")
+                    .font(.system(size: 46, weight: .semibold))
+                    .foregroundStyle(.tint)
+                VStack(spacing: 8) {
+                    Text("Open a NoctBoard source")
+                        .font(.largeTitle.bold())
+                    Text("Verify retained encrypted board state, or inspect a bounded redacted audit export. No fixture data is loaded automatically.")
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                if let error = model.errorMessage {
+                    Label(error, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                }
+                Button {
+                    showingLiveBoardOpen = true
+                } label: {
+                    Label("Open Live Board", systemImage: "lock.open.display")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                Button {
+                    showingImporter = true
+                } label: {
+                    Label("Inspect Audit Export", systemImage: "doc.text.magnifyingglass")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+            }
+            .frame(maxWidth: 520)
+            .padding(36)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .navigationTitle("NoctBoard")
+        }
+    }
+
+    private var hasOpenedSource: Bool {
+        model.result != nil || model.importedAudit != nil || model.isImportingAudit
+    }
+
+    private var availableSections: [Section] {
+        var sections: [Section] = []
+        if model.result != nil {
+            sections.append(contentsOf: [.overview, .threads, .tasks, .members, .ledger])
+        }
+        if model.importedAudit != nil || model.isImportingAudit {
+            sections.append(.importedAudit)
+        }
+        return sections
+    }
+
     @ViewBuilder
     private var detail: some View {
         if let error = model.errorMessage {
@@ -362,14 +415,6 @@ public struct NoctBoardAuditConsole: View {
                     EmptyView()
                 }
             }
-        } else {
-            ContentUnavailableView(
-                "No board opened",
-                systemImage: "lock.open.display",
-                description: Text(
-                    "Open an authorized encrypted client-state file or inspect a redacted audit JSONL export. No fixture data is loaded automatically."
-                )
-            )
         }
     }
 }
@@ -566,8 +611,11 @@ private struct OverviewView: View {
                     Metric(title: "Tasks", value: result.projection.tasks.count, color: .purple)
                 }
 
-                GroupBox("Projection digest") {
+                DisclosureGroup("Evidence & Technical Details") {
                     VStack(alignment: .leading, spacing: 8) {
+                        Text(sourceTechnicalDetail)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
                         Text(result.projectionDigest)
                             .font(.system(.body, design: .monospaced))
                             .textSelection(.enabled)
@@ -618,8 +666,8 @@ private struct OverviewView: View {
             "No local board state has been selected."
         case .deterministicFixture:
             "Fixed demo data, not live encrypted Noctweave state"
-        case .liveLocal(let boardID, let epoch, let eventCount, _):
-            "Board \(boardID.uuidString.lowercased()) · epoch \(epoch) · \(eventCount) retained event(s)"
+        case .liveLocal(_, let epoch, let eventCount, _):
+            "Verified local state · epoch \(epoch) · \(eventCount) retained event(s)"
         }
     }
 
@@ -633,8 +681,19 @@ private struct OverviewView: View {
             "Open an authorized encrypted client-state file to verify its board/group binding."
         case .deterministicFixture:
             "The v1 fixture uses one UUID for both board and Noctweave group."
+        case .liveLocal:
+            "Strict v1 board/group binding verified."
+        }
+    }
+
+    private var sourceTechnicalDetail: String {
+        switch source {
+        case .unopened:
+            "No board identifier is available."
+        case .deterministicFixture:
+            "Source: deterministic fixture · board/group identifier is fixture-scoped"
         case .liveLocal(let boardID, _, _, _):
-            "Strict v1 binding verified for board/group \(boardID.uuidString.lowercased())."
+            "Board/group identifier: \(boardID.uuidString.lowercased())"
         }
     }
 
@@ -794,9 +853,17 @@ private struct MembersView: View {
                 Image(systemName: roleIcon(member.role)).font(.title2).foregroundStyle(roleColor(member.role))
                 VStack(alignment: .leading, spacing: 4) {
                     Text(member.role.rawValue.capitalized).font(.headline)
-                    Text(member.memberHandle.rawValue).font(.caption.monospaced()).textSelection(.enabled)
-                    Text("Credential \(shortHandle(member.credentialHandle.rawValue))")
-                        .font(.caption.monospaced()).foregroundStyle(.secondary)
+                    Text(shortHandle(member.memberHandle.rawValue))
+                        .font(.caption.monospaced())
+                    DisclosureGroup("Credential details") {
+                        Text("Member \(member.memberHandle.rawValue)")
+                            .font(.caption2.monospaced())
+                            .textSelection(.enabled)
+                        Text("Credential \(member.credentialHandle.rawValue)")
+                            .font(.caption2.monospaced())
+                            .textSelection(.enabled)
+                    }
+                    .font(.caption)
                 }
                 Spacer()
                 Text(roleDescription(member.role)).font(.caption).foregroundStyle(.secondary)
@@ -846,7 +913,12 @@ private struct LedgerView: View {
                             .font(.caption)
                             .foregroundStyle(.orange)
                         }
-                        Text(entry.eventDigest).font(.caption2.monospaced()).textSelection(.enabled)
+                        DisclosureGroup("Evidence") {
+                            Text(entry.eventDigest)
+                                .font(.caption2.monospaced())
+                                .textSelection(.enabled)
+                        }
+                        .font(.caption)
                     }
                 }
                 .padding(.vertical, 5)
@@ -886,8 +958,9 @@ private struct ImportedAuditView: View {
                         )
                         Spacer()
                     }
-                    Text(audit.sourceURL.path).font(.caption.monospaced()).textSelection(.enabled)
-                    Text("This inspection does not cryptographically replay the redacted file or recover the plaintext projection.")
+                    Text(audit.sourceURL.lastPathComponent)
+                        .font(.caption.monospaced())
+                    Text("Imported redacted audit — this inspector does not cryptographically replay or sign the export, and cannot recover the plaintext projection.")
                         .padding()
                         .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
                     HStack(spacing: 12) {
@@ -905,10 +978,18 @@ private struct ImportedAuditView: View {
                             color: .orange
                         )
                     }
-                    GroupBox("Projection digest recorded by exporter") {
-                        Text(audit.projectionDigest ?? "Missing")
-                            .font(.body.monospaced()).textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 4)
+                    DisclosureGroup("Evidence & Technical Details") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            LabeledContent("Schema", value: audit.schema ?? "Missing")
+                            Text(audit.sourceURL.path)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                            Text(audit.projectionDigest ?? "Missing projection digest")
+                                .font(.body.monospaced())
+                                .textSelection(.enabled)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 4)
                     }
                     if !audit.containerRejections.isEmpty {
                         GroupBox("Rejected Noctweave containers") {
