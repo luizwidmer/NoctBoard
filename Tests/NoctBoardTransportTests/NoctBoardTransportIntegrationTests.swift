@@ -746,7 +746,7 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
             to: owner,
             board: created.board,
             bindingByte: 0xA1,
-            at: base.addingTimeInterval(2)
+            at: NoctweaveRendezvousV2.canonicalTimestamp(Date().addingTimeInterval(-2))
         )
         trace("agent-a-admitted")
         _ = try await owner.synchronize()
@@ -757,7 +757,9 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
             to: owner,
             board: created.board,
             bindingByte: 0xB2,
-            at: base.addingTimeInterval(5)
+            // Start each live admission with a fresh proof timestamp. Prior PQ
+            // work may take longer than the relay's authorization window.
+            at: NoctweaveRendezvousV2.canonicalTimestamp(Date().addingTimeInterval(-2))
         )
         trace("agent-b-admitted")
         _ = try await owner.synchronize()
@@ -794,9 +796,7 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
             $0.id == created.initialPublication.event.id
         }?.content.payload)
 
-        let hostileHistoryDate = NoctweaveRendezvousV2.canonicalTimestamp(
-            base.addingTimeInterval(7)
-        )
+        let hostileHistoryDate = NoctweaveRendezvousV2.canonicalTimestamp(Date())
         let hostileHistorySnapshot = try await agentB.snapshot()
         let hostileHistory = GroupConversationEventV2(
             groupID: created.board.groupID,
@@ -825,9 +825,7 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
         )
         trace("hostile-history-member-send-done")
 
-        let malformedHistoryDate = NoctweaveRendezvousV2.canonicalTimestamp(
-            base.addingTimeInterval(7.2)
-        )
+        let malformedHistoryDate = NoctweaveRendezvousV2.canonicalTimestamp(Date())
         let malformedHistory = GroupConversationEventV2(
             groupID: created.board.groupID,
             authorMemberHandle: historyAtOwner.localMemberHandle,
@@ -847,9 +845,7 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
             at: malformedHistoryDate
         )
         trace("malformed-history-owner-send-done")
-        let forgedHistoryDate = NoctweaveRendezvousV2.canonicalTimestamp(
-            base.addingTimeInterval(7.4)
-        )
+        let forgedHistoryDate = NoctweaveRendezvousV2.canonicalTimestamp(Date())
         let forgedSignedRecord = NoctBoardSignedEventRecord(
             eventBytes: try NoctBoardCodec.encode(created.initialPublication.event),
             authorSignature: Data([0x01])
@@ -907,12 +903,12 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
         )
         let taskPublication = try await owner.publish(
             .createTask(task),
-            createdAt: base.addingTimeInterval(8)
+            createdAt: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         try await requireComplete(
             taskPublication,
             client: owner,
-            at: base.addingTimeInterval(8)
+            at: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         trace("task-published")
         let agentATaskSync = try await agentA.synchronize()
@@ -926,7 +922,7 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
         do {
             _ = try await agentA.publish(
                 .createThread(NoctBoardCreateThread(title: "worker cannot create this")),
-                createdAt: base.addingTimeInterval(9)
+                createdAt: NoctweaveRendezvousV2.canonicalTimestamp(Date())
             )
             XCTFail("worker thread creation must fail local authorization preflight")
         } catch let error as NoctBoardTransportError {
@@ -940,12 +936,12 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
                 taskID: taskID,
                 assigneeMemberHandle: agentAHandle
             )),
-            createdAt: base.addingTimeInterval(10)
+            createdAt: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         try await requireComplete(
             assignmentPublication,
             client: agentA,
-            at: base.addingTimeInterval(10)
+            at: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         let activationPublication = try await agentA.publish(
             .transitionTask(NoctBoardTransitionTask(
@@ -953,12 +949,12 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
                 from: .pending,
                 to: .active
             )),
-            createdAt: base.addingTimeInterval(11)
+            createdAt: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         try await requireComplete(
             activationPublication,
             client: agentA,
-            at: base.addingTimeInterval(11)
+            at: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         trace("task-claimed")
         _ = try await agentB.synchronize()
@@ -968,9 +964,7 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
         // clock gap without consuming its author chain; honest publication can
         // therefore continue with a deterministic small next clock.
         let agentBBeforePoison = try await agentB.snapshot()
-        let poisonDate = NoctweaveRendezvousV2.canonicalTimestamp(
-            base.addingTimeInterval(11.5)
-        )
+        let poisonDate = NoctweaveRendezvousV2.canonicalTimestamp(Date())
         let poisonOperation = NoctBoardOperation.postMessage(NoctBoardPostMessage(
             threadID: created.initialThreadID,
             taskID: taskID,
@@ -1040,12 +1034,12 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
                 taskID: taskID,
                 body: "result \(marker)"
             )),
-            createdAt: base.addingTimeInterval(12)
+            createdAt: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         try await requireComplete(
             resultPublication,
             client: agentB,
-            at: base.addingTimeInterval(12)
+            at: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         trace("result-published")
 
@@ -1061,12 +1055,12 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
                 from: .active,
                 to: .completed
             )),
-            createdAt: base.addingTimeInterval(13)
+            createdAt: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         try await requireComplete(
             completionPublication,
             client: agentA,
-            at: base.addingTimeInterval(13)
+            at: NoctweaveRendezvousV2.canonicalTimestamp(Date())
         )
         trace("task-completed")
         _ = try await owner.synchronize()

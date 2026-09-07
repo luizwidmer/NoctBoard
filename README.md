@@ -166,6 +166,10 @@ notarization remains a separate distribution step.
 `NoctBoardApp` starts without board data, can
 structurally inspect a redacted audit JSONL file, and can open an authorized
 live encrypted Noctweave client-state file for local projection/audit. Opening
+requires choosing its containing folder in the sandboxed app, because atomic
+replacement, lock files, and recovery records also need directory access. Keep
+each board's state in a dedicated folder and enter its state filename there.
+Opening
 does not fetch messages, but may persist normal encrypted-store migrations,
 rollback anchors, and the selected relay preference. “Sync Encrypted Board” is
 the separate network action. Live CLI commands use encrypted client state by

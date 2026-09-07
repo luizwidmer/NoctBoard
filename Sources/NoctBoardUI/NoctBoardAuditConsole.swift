@@ -67,7 +67,8 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
         relayEndpoint: String,
         storageScopeIdentifier: String?,
         relayAccessPassword: String?,
-        plaintextTesting: Bool
+        plaintextTesting: Bool,
+        stateDirectoryURL: URL? = nil
     ) {
         isLoadingLiveBoard = true
         errorMessage = nil
@@ -84,7 +85,10 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
                 let normalizedPassword = relayAccessPassword?.isEmpty == false
                     ? relayAccessPassword
                     : nil
-                let startedAccess = stateFileURL.startAccessingSecurityScopedResource()
+                // Atomic state replacement, lock files, and NoctBoard recovery
+                // records require the selected directory, not only the JSON file.
+                let accessURL = stateDirectoryURL ?? stateFileURL
+                let startedAccess = accessURL.startAccessingSecurityScopedResource()
                 do {
                     let client = try await NoctBoardClient.open(
                         configuration: NoctBoardClientOpenConfiguration(
@@ -104,16 +108,20 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
                     let snapshot = try await client.snapshot()
                     self.replaceLiveClient(
                         client,
-                        securityScopedStateURL: startedAccess ? stateFileURL : nil
+                        securityScopedStateURL: startedAccess ? accessURL : nil
                     )
                     self.apply(snapshot)
                     self.errorMessage = nil
                 } catch {
-                    if startedAccess { stateFileURL.stopAccessingSecurityScopedResource() }
+                    if startedAccess { accessURL.stopAccessingSecurityScopedResource() }
                     throw error
                 }
             } catch {
-                self.errorMessage = "Unable to open live board state: \(error.localizedDescription)"
+                if error as? ClientStateStoreError == .storageUnavailable {
+                    self.errorMessage = "Unable to access board storage. Choose the folder containing the state file and make sure the folder is writable."
+                } else {
+                    self.errorMessage = "Unable to open live board state: \(error.localizedDescription)"
+                }
             }
             self.isLoadingLiveBoard = false
         }
@@ -249,7 +257,8 @@ public struct NoctBoardAuditConsole: View {
                     relayEndpoint: request.relayEndpoint,
                     storageScopeIdentifier: request.storageScopeIdentifier,
                     relayAccessPassword: request.relayAccessPassword,
-                    plaintextTesting: request.plaintextTesting
+                    plaintextTesting: request.plaintextTesting,
+                    stateDirectoryURL: request.stateDirectoryURL
                 )
                 selection = .overview
             }
@@ -330,11 +339,13 @@ public struct NoctBoardAuditConsole: View {
                     Text("Verify retained encrypted board state, or inspect a bounded redacted audit export. No fixture data is loaded automatically.")
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if let error = model.errorMessage {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.red)
                         .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Button {
                     showingLiveBoardOpen = true
@@ -421,6 +432,7 @@ public struct NoctBoardAuditConsole: View {
 
 private struct LiveBoardOpenRequest: @unchecked Sendable {
     let stateFileURL: URL
+    let stateDirectoryURL: URL?
     let boardID: String
     let displayName: String
     let relayEndpoint: String
@@ -434,7 +446,7 @@ private struct LiveBoardOpenSheet: View {
     let onOpen: (LiveBoardOpenRequest) -> Void
 
     @State private var stateFilePath = ""
-    @State private var selectedStateFileURL: URL?
+    @State private var selectedStateDirectoryURL: URL?
     @State private var boardID = ""
     @State private var displayName = "Human auditor"
     @State private var relayEndpoint = "http://127.0.0.1:9340"
@@ -451,12 +463,16 @@ private struct LiveBoardOpenSheet: View {
                         TextField("Absolute encrypted state-file path", text: $stateFilePath)
                             .textFieldStyle(.roundedBorder)
                             .onChange(of: stateFilePath) { _, newValue in
-                                if selectedStateFileURL?.path != newValue {
-                                    selectedStateFileURL = nil
+                                if selectedStateDirectoryURL?.standardizedFileURL
+                                    != URL(fileURLWithPath: newValue).deletingLastPathComponent().standardizedFileURL {
+                                    selectedStateDirectoryURL = nil
                                 }
                             }
-                        Button("Choose…") { showingStateFileImporter = true }
+                        Button("Choose Folder…") { showingStateFileImporter = true }
                     }
+                    Text("Choose the folder containing this board's state file. NoctBoard also needs its adjacent lock and recovery files. Use a dedicated folder for each board.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                     TextField("Board UUID", text: $boardID)
                         .textFieldStyle(.roundedBorder)
                     TextField("Local display label", text: $displayName)
@@ -503,8 +519,8 @@ private struct LiveBoardOpenSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Open Retained Snapshot") {
                         let request = LiveBoardOpenRequest(
-                            stateFileURL: selectedStateFileURL
-                                ?? URL(fileURLWithPath: stateFilePath).standardizedFileURL,
+                            stateFileURL: URL(fileURLWithPath: stateFilePath).standardizedFileURL,
+                            stateDirectoryURL: selectedStateDirectoryURL,
                             boardID: boardID,
                             displayName: displayName,
                             relayEndpoint: relayEndpoint,
@@ -526,12 +542,15 @@ private struct LiveBoardOpenSheet: View {
         }
         .fileImporter(
             isPresented: $showingStateFileImporter,
-            allowedContentTypes: [.data],
+            allowedContentTypes: [.folder],
             allowsMultipleSelection: false
         ) { response in
             if case .success(let urls) = response, let url = urls.first {
-                selectedStateFileURL = url
-                stateFilePath = url.path
+                let filename = stateFilePath.isEmpty
+                    ? "state.json"
+                    : URL(fileURLWithPath: stateFilePath).lastPathComponent
+                stateFilePath = url.appendingPathComponent(filename).path
+                selectedStateDirectoryURL = url
             }
         }
         .frame(minWidth: 680, minHeight: 570)
