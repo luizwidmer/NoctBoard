@@ -351,22 +351,26 @@ public struct NoctBoardAuditConsole: View {
                     showingLiveBoardOpen = true
                 } label: {
                     Label("Open Live Board", systemImage: "lock.open.display")
-                        .frame(maxWidth: .infinity)
+                        .frame(maxWidth: .infinity, minHeight: 30)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+                .buttonStyle(SourceActionStyle(prominent: true))
 
                 Button {
                     showingImporter = true
                 } label: {
                     Label("Inspect Audit Export", systemImage: "doc.text.magnifyingglass")
-                        .frame(maxWidth: .infinity)
+                        .frame(maxWidth: .infinity, minHeight: 30)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
+                .buttonStyle(SourceActionStyle(prominent: false))
             }
-            .frame(maxWidth: 520)
-            .padding(36)
+            .padding(32)
+            .frame(maxWidth: 560)
+            .background(.background, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(.primary.opacity(0.10), lineWidth: 1)
+            }
+            .padding(32)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("NoctBoard")
         }
@@ -441,6 +445,23 @@ private struct LiveBoardOpenRequest: @unchecked Sendable {
     let plaintextTesting: Bool
 }
 
+private struct SourceActionStyle: ButtonStyle {
+    let prominent: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.headline)
+            .padding(.horizontal, 16)
+            .frame(minHeight: 44)
+            .foregroundStyle(prominent ? Color.white : Color.primary)
+            .background(
+                prominent ? Color.accentColor : Color.primary.opacity(0.07),
+                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+            )
+            .opacity(configuration.isPressed ? 0.8 : 1)
+    }
+}
+
 private struct LiveBoardOpenSheet: View {
     @Environment(\.dismiss) private var dismiss
     let onOpen: (LiveBoardOpenRequest) -> Void
@@ -459,16 +480,21 @@ private struct LiveBoardOpenSheet: View {
         NavigationStack {
             Form {
                 Section("Authorized local state") {
-                    HStack {
-                        TextField("Absolute encrypted state-file path", text: $stateFilePath)
-                            .textFieldStyle(.roundedBorder)
-                            .onChange(of: stateFilePath) { _, newValue in
-                                if selectedStateDirectoryURL?.standardizedFileURL
-                                    != URL(fileURLWithPath: newValue).deletingLastPathComponent().standardizedFileURL {
-                                    selectedStateDirectoryURL = nil
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Encrypted state file")
+                        HStack {
+                            TextField("Absolute encrypted state-file path", text: $stateFilePath)
+                                .labelsHidden()
+                                .textFieldStyle(.roundedBorder)
+                                .onChange(of: stateFilePath) { _, newValue in
+                                    if selectedStateDirectoryURL?.standardizedFileURL
+                                        != URL(fileURLWithPath: newValue).deletingLastPathComponent().standardizedFileURL {
+                                        selectedStateDirectoryURL = nil
+                                    }
                                 }
-                            }
-                        Button("Choose Folder…") { showingStateFileImporter = true }
+                            Button("Choose Folder…") { showingStateFileImporter = true }
+                                .fixedSize()
+                        }
                     }
                     Text("Choose the folder containing this board's state file. NoctBoard also needs its adjacent lock and recovery files. Use a dedicated folder for each board.")
                         .font(.caption)
