@@ -905,6 +905,9 @@ public actor NoctBoardClient {
             throw NoctBoardTransportError.invalidOpenConfiguration
         }
 
+        if FileManager.default.fileExists(atPath: configuration.stateFileURL.appendingPathExtension("purge-pending-v1").path) {
+            try await purgeLocalState(configuration: configuration)
+        }
         let store = ClientStateStore(
             fileURL: configuration.stateFileURL,
             protection: configuration.stateProtection,
@@ -935,6 +938,42 @@ public actor NoctBoardClient {
             try await result.requireBoardAccessVerified(board)
         }
         return result
+    }
+
+    /// The caller must first drain local operations and discard its live client.
+    /// A durable marker ensures reopening this state retries interrupted cleanup.
+    public static func purgeLocalState(configuration: NoctBoardClientOpenConfiguration) async throws {
+        guard let scope = configuration.storageScopeIdentifier, !scope.isEmpty else {
+            throw NoctBoardTransportError.invalidOpenConfiguration
+        }
+        let marker = configuration.stateFileURL.appendingPathExtension("purge-pending-v1")
+        let store = ClientStateStore(fileURL: configuration.stateFileURL,
+            protection: configuration.stateProtection, storageScopeIdentifier: scope)
+        let admission = NoctBoardAdmissionStateStore(stateFileURL: configuration.stateFileURL,
+            protection: configuration.stateProtection, storageScopeIdentifier: scope)
+        try await admission.beginFullReset(at: marker)
+        var failure: Error?
+        do {
+            if configuration.stateProtection == .encrypted {
+                try await store.destroyLocalEncryptionMaterial(preservingCiphertext: false)
+            } else { try await store.eraseAllLocalState() }
+        } catch { failure = error }
+        do { try await admission.purge() } catch { failure = error }
+        do {
+            let stateName = configuration.stateFileURL.lastPathComponent
+            for file in try FileManager.default.contentsOfDirectory(at: configuration.stateFileURL.deletingLastPathComponent(), includingPropertiesForKeys: nil) {
+                for name in [stateName, stateName + ".pending"] {
+                    let prefix = "." + name + "."
+                    let candidate = file.lastPathComponent
+                    if candidate.hasPrefix(prefix), candidate.hasSuffix(".tmp"),
+                       UUID(uuidString: String(candidate.dropFirst(prefix.count).dropLast(4))) != nil {
+                        try FileManager.default.removeItem(at: file)
+                    }
+                }
+            }
+        } catch { failure = error }
+        if let failure { throw failure }
+        try FileManager.default.removeItem(at: marker)
     }
 
     static func validateRelayAuthentication(

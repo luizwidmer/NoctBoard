@@ -36,8 +36,14 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
         NoctBoardHistoryBootstrapProvenance
     ] = []
 
+    @Published public private(set) var isResetting = false
+    @Published public private(set) var resetIsPending = false
+    @Published public var showsResetConfirmation = false
+    private var liveConfiguration: NoctBoardClientOpenConfiguration?
+    private var operations: [UUID: Task<Void, Never>] = [:]
     private var liveClient: NoctBoardClient?
     private var securityScopedStateURL: URL?
+    private var resetStateAccessURL: URL?
 
     public init(loadEvaluationFixture: Bool = false) {
         if loadEvaluationFixture {
@@ -45,7 +51,58 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
         }
     }
 
+    private func runOperation(_ body: @escaping @MainActor () async -> Void) {
+        guard !resetIsPending else { return }
+        let id = UUID()
+        operations[id] = Task { [weak self] in
+            defer { self?.operations[id] = nil }
+            guard self?.resetIsPending == false else { return }
+            await body()
+        }
+    }
+
+    public var resetDescription: String {
+        if let configuration = liveConfiguration {
+            return "Remove this app’s loaded data, settings, and the local board state at \(configuration.stateFileURL.path), including its keys and admission recovery records. Exported audits and other devices’ copies remain."
+        }
+        return "Remove this app’s loaded data and settings. Audit exports and external files remain."
+    }
+
+    public func purgeAndReset() async {
+        guard !isResetting else { return }
+        isResetting = true; resetIsPending = true
+        defer { isResetting = false }
+        let pending = Array(operations.values)
+        pending.forEach { $0.cancel() }
+        for task in pending { await task.value }
+        liveClient = nil
+        isLoadingLiveBoard = false; isImportingAudit = false
+        result = nil; importedAudit = nil; containerRejections = []; historyBootstrapProvenance = []
+        source = .unopened
+        do {
+            if let liveConfiguration {
+                // A failed open or switching to the demo may have released the
+                // original access lease. Retain the selected URL for reset retry.
+                let accessURL = resetStateAccessURL
+                let startedAccess = accessURL?.startAccessingSecurityScopedResource() ?? false
+                defer { if startedAccess { accessURL?.stopAccessingSecurityScopedResource() } }
+                try await NoctBoardClient.purgeLocalState(configuration: liveConfiguration)
+            }
+            stopAccessingStateFile()
+            liveConfiguration = nil
+            resetStateAccessURL = nil
+            if let domain = Bundle.main.bundleIdentifier {
+                UserDefaults.standard.removePersistentDomain(forName: domain)
+            }
+            URLCache.shared.removeAllCachedResponses()
+            errorMessage = nil; resetIsPending = false
+        } catch {
+            errorMessage = "Reset could not finish. Retry to complete removal: \(error.localizedDescription)"
+        }
+    }
+
     public func loadDeterministicDemo() {
+        guard !resetIsPending else { return }
         do {
             result = try NoctBoardDemoFixture.make()
             source = .deterministicFixture
@@ -70,9 +127,10 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
         plaintextTesting: Bool,
         stateDirectoryURL: URL? = nil
     ) {
+        guard !resetIsPending else { return }
         isLoadingLiveBoard = true
         errorMessage = nil
-        Task { [weak self] in
+        runOperation { [weak self] in
             guard let self else { return }
             do {
                 guard let boardUUID = UUID(uuidString: boardID) else {
@@ -90,8 +148,7 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
                 let accessURL = stateDirectoryURL ?? stateFileURL
                 let startedAccess = accessURL.startAccessingSecurityScopedResource()
                 do {
-                    let client = try await NoctBoardClient.open(
-                        configuration: NoctBoardClientOpenConfiguration(
+                    let configuration = NoctBoardClientOpenConfiguration(
                             stateFileURL: stateFileURL.standardizedFileURL,
                             storageScopeIdentifier: normalizedScope?.isEmpty == false
                                 ? normalizedScope
@@ -102,9 +159,10 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
                             stateProtection: plaintextTesting
                                 ? .insecurePlaintextForTesting
                                 : .encrypted
-                        ),
-                        board: board
-                    )
+                        )
+                    self.liveConfiguration = configuration
+                    self.resetStateAccessURL = accessURL
+                    let client = try await NoctBoardClient.open(configuration: configuration, board: board)
                     let snapshot = try await client.snapshot()
                     self.replaceLiveClient(
                         client,
@@ -135,9 +193,10 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
             errorMessage = "Open a live local board before synchronizing."
             return
         }
+        guard !resetIsPending else { return }
         isLoadingLiveBoard = true
         errorMessage = nil
-        Task { [weak self] in
+        runOperation { [weak self] in
             guard let self else { return }
             do {
                 let synchronized = try await liveClient.synchronize()
@@ -176,10 +235,11 @@ public final class NoctBoardAuditConsoleModel: ObservableObject {
     }
 
     public func importAudit(from url: URL) {
-        let hasAccess = url.startAccessingSecurityScopedResource()
+        guard !resetIsPending else { return }
         isImportingAudit = true
         errorMessage = nil
-        Task { [weak self] in
+        runOperation { [weak self] in
+            let hasAccess = url.startAccessingSecurityScopedResource()
             defer {
                 if hasAccess { url.stopAccessingSecurityScopedResource() }
                 self?.isImportingAudit = false
@@ -228,6 +288,7 @@ public struct NoctBoardAuditConsole: View {
 
     @StateObject private var model: NoctBoardAuditConsoleModel
     @State private var selection: Section?
+    @State private var resetConfirmation = ""
     @State private var showingImporter = false
     @State private var showingLiveBoardOpen = false
 
@@ -240,13 +301,38 @@ public struct NoctBoardAuditConsole: View {
         _selection = State(initialValue: loadEvaluationFixture ? .overview : nil)
     }
 
+    public init(model: NoctBoardAuditConsoleModel) {
+        _model = StateObject(wrappedValue: model)
+        _selection = State(initialValue: nil)
+    }
+
     public var body: some View {
         Group {
-            if hasOpenedSource {
+            if model.resetIsPending {
+                VStack(spacing: 18) {
+                    Text("Finish resetting NoctBoard").font(.title2)
+                    if model.isResetting { ProgressView("Removing local data…") }
+                    else {
+                        Text(model.errorMessage ?? "Reset needs to finish before you can continue.")
+                            .foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        Button("Retry Reset", role: .destructive) { Task { await model.purgeAndReset() } }
+                    }
+                }.padding(40).frame(maxWidth: 600)
+            } else if hasOpenedSource {
                 auditWorkspace
             } else {
                 sourceChooser
             }
+        }
+        .alert("Purge and reset NoctBoard?", isPresented: $model.showsResetConfirmation) {
+            TextField("Type RESET to confirm", text: $resetConfirmation)
+            Button("Cancel", role: .cancel) { resetConfirmation = "" }
+            Button("Purge and Reset", role: .destructive) {
+                resetConfirmation = ""; selection = nil
+                Task { await model.purgeAndReset() }
+            }.disabled(resetConfirmation != "RESET")
+        } message: {
+            Text(model.resetDescription + " This cannot be undone. Type RESET to continue.")
         }
         .sheet(isPresented: $showingLiveBoardOpen) {
             LiveBoardOpenSheet { request in
@@ -305,6 +391,7 @@ public struct NoctBoardAuditConsole: View {
             detail
                 .navigationTitle(selection?.rawValue ?? "NoctBoard")
                 .toolbar {
+                    resetButton
                     if model.source.isLiveLocal {
                         Button {
                             model.synchronizeLiveBoard()
@@ -373,7 +460,14 @@ public struct NoctBoardAuditConsole: View {
             .padding(32)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("NoctBoard")
+            .toolbar { resetButton }
         }
+    }
+
+    private var resetButton: some View {
+        Button("Purge and Reset App…", systemImage: "trash", role: .destructive) {
+            resetConfirmation = ""; model.showsResetConfirmation = true
+        }.accessibilityIdentifier("app.purgeAndReset").disabled(model.isResetting)
     }
 
     private var hasOpenedSource: Bool {

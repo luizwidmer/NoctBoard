@@ -8,6 +8,30 @@ import NoctBoardCore
 @preconcurrency import NoctweaveCore
 
 final class NoctBoardTransportIntegrationTests: XCTestCase {
+    func testExplicitPurgeRemovesStateAndPrivateJournalButPreservesNeighbor() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("noctboard-reset-test-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let state = root.appendingPathComponent("board-state.json")
+        let neighbor = root.appendingPathComponent("export.jsonl")
+        let orphan = root.appendingPathComponent(".board-state.json.\(UUID()).tmp")
+        let journal = state.appendingPathExtension("noctboard-private")
+        try FileManager.default.createDirectory(at: journal, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        for file in [state, neighbor, orphan, journal.appendingPathComponent("admission-state.json")] {
+            try Data("fixture".utf8).write(to: file)
+        }
+        let configuration = NoctBoardClientOpenConfiguration(stateFileURL: state,
+            storageScopeIdentifier: "org.noctboard.tests.reset.\(UUID())", displayName: "Fixture",
+            relay: RelayEndpoint(host: "127.0.0.1", port: 19340), stateProtection: .insecurePlaintextForTesting)
+        try await NoctBoardClient.purgeLocalState(configuration: configuration)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.appendingPathExtension("purge-pending-v1").path))
+        XCTAssertEqual(try Data(contentsOf: neighbor), Data("fixture".utf8))
+        try await NoctBoardClient.purgeLocalState(configuration: configuration)
+    }
+
     func testRelayPasswordsRequireTLS() throws {
         for transport in RelayEndpointTransport.allCases {
             XCTAssertThrowsError(try NoctBoardClient.validateRelayAuthentication(

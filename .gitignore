@@ -3,6 +3,9 @@
 .swiftpm/
 dist/
 *.xcuserstate
+xcuserdata/
+DerivedData/
+*.xcresult/
 
 # Private local integration guide; keep the tracked example current.
 /AGENTS.md

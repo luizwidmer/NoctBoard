@@ -10,6 +10,25 @@ import XCTest
 
 final class NoctBoardAuditSurfaceTests: XCTestCase {
     @MainActor
+    func testResetCancelsQueuedImportAndReturnsToSourceChooser() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("noctboard-reset-import-\(UUID()).jsonl")
+        try Data("disposable audit fixture".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let model = NoctBoardAuditConsoleModel(loadEvaluationFixture: true)
+        model.importAudit(from: file)
+        XCTAssertTrue(model.isImportingAudit)
+        await model.purgeAndReset()
+        XCTAssertEqual(model.source, .unopened)
+        XCTAssertNil(model.result)
+        XCTAssertNil(model.importedAudit)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertFalse(model.isImportingAudit)
+        XCTAssertFalse(model.isLoadingLiveBoard)
+        XCTAssertFalse(model.resetIsPending)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+    }
+
+    @MainActor
     func testAuditConsoleStartsWithoutFixtureData() {
         let model = NoctBoardAuditConsoleModel()
 

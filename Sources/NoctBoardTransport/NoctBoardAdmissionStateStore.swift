@@ -258,6 +258,7 @@ actor NoctBoardAdmissionStateStore {
     static let maximumPackageReservationBytes =
         ((NoctBoardAdmissionCodec.maximumArtifactBytes + 2) / 3) * 4
             + (1 * 1_024 * 1_024)
+    private var retired = false
     private static let service = "org.noctboard.securestorage"
     private static let aadDomain = Data("org.noctboard.admission-state.aad.v1\0".utf8)
 
@@ -417,6 +418,32 @@ actor NoctBoardAdmissionStateStore {
         fileURL = nil
         protection = .memoryOnly
         cached = Document()
+    }
+
+    func beginFullReset(at marker: URL) throws {
+        try ensurePrivateDirectory(marker.deletingLastPathComponent())
+        try writeSecureFile(Data("purge-v1".utf8), to: marker)
+    }
+
+    /// Only for explicit whole-state reset, never admission recovery.
+    func purge() throws {
+        retired = true
+        cached = nil
+        var failure: Error?
+        if case .encrypted(let account, _) = protection {
+            do { try SecureStorageKeyProvider.shared.destroyKey(service: Self.service, account: account) }
+            catch { failure = error }
+        }
+        if let fileURL {
+            let directory = fileURL.deletingLastPathComponent()
+            do {
+                if FileManager.default.fileExists(atPath: directory.path) {
+                    try ensurePrivateDirectory(directory)
+                    try FileManager.default.removeItem(at: directory)
+                }
+            } catch { failure = error }
+        }
+        if let failure { throw failure }
     }
 
     func acquireOwnerOperationLease() throws -> NoctBoardOwnerOperationLease {
@@ -637,6 +664,7 @@ actor NoctBoardAdmissionStateStore {
         exclusive: Bool,
         _ body: () throws -> T
     ) throws -> T {
+        guard !retired else { throw NoctBoardAdmissionStateStoreError.storageUnavailable }
         if case .memoryOnly = protection {
             return try body()
         }
