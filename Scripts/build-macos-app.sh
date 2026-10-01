@@ -16,18 +16,26 @@ scratch_path="${NOCTBOARD_BUILD_PATH:-$repository_dir/.build}"
 bundle_path="$repository_dir/dist/NoctBoard.app"
 contents_path="$bundle_path/Contents"
 codesign_identity="${NOCTBOARD_CODESIGN_IDENTITY:--}"
+swift_build_options=(--configuration "$configuration")
+if [[ "$(swift build --help)" == *swiftbuild* ]]; then
+    swift_build_options+=(--build-system swiftbuild)
+fi
+if [[ "${NOCTWEAVE_OFFLINE:-0}" == "1" ]]; then
+    swift_build_options+=(--disable-automatic-resolution)
+fi
 
 swift build \
     --package-path "$repository_dir" \
     --scratch-path "$scratch_path" \
-    --configuration "$configuration" \
+    "${swift_build_options[@]}" \
     --product NoctBoardApp
 
 binary_dir="$(swift build \
     --package-path "$repository_dir" \
     --scratch-path "$scratch_path" \
-    --configuration "$configuration" \
+    "${swift_build_options[@]}" \
     --show-bin-path)"
+test -x "$binary_dir/NoctBoardApp"
 
 rm -rf -- "$bundle_path"
 mkdir -p "$contents_path/MacOS"

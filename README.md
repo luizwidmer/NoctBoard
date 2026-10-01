@@ -215,6 +215,10 @@ enables the real post-quantum loopback flow:
 Scripts/verify.sh
 ```
 
+With dependencies already cached, `Scripts/verify.sh --offline` runs the same
+build, unit tests, Release relay integration and demo without fetching or
+resolving packages. Both modes enforce the manifest's immutable Noctweave pin.
+
 Use [the CLI guide](CLI_GUIDE.md) for live state, private text files,
 crash-safe publication, admission, and lease maintenance.
 

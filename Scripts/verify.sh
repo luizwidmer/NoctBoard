@@ -4,7 +4,17 @@
 
 set -euo pipefail
 
-NOCTBOARD_EXPECTED_NOCTWEAVE_REVISION="f8351b0412ec7f46c8fd18b4a5034d7a72f18d8f"
+NOCTBOARD_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$NOCTBOARD_ROOT"
+
+NOCTBOARD_SWIFT_FLAGS=(--disable-automatic-resolution)
+# --offline requires existing lockfile/checkouts instead of re-resolving them.
+if (( $# > 1 )) || [[ $# == 1 && "${1:-}" != "--offline" ]]; then
+  echo "Usage: Scripts/verify.sh [--offline]" >&2
+  exit 2
+fi
+
+NOCTBOARD_EXPECTED_NOCTWEAVE_REVISION="7ffaff6b74d8ede577a130f1d88275a3066d0fd3"
 
 for NOCTBOARD_PIN_FILE in Package.swift Package.resolved; do
   if ! grep -Fq "${NOCTBOARD_EXPECTED_NOCTWEAVE_REVISION}" "${NOCTBOARD_PIN_FILE}"; then
@@ -30,12 +40,14 @@ if [[ -n "${NOCTWEAVE_PACKAGE_PATH:-}" ]]; then
     exit 2
   fi
 else
-  swift package resolve
+  if [[ $# == 0 ]]; then
+    swift package resolve
+  fi
   git diff --exit-code -- Package.resolved
 fi
 
-swift build
-swift test
-NOCTBOARD_RUN_RELAY_INTEGRATION=1 swift test -c release
-swift run -c release NoctBoardDemo
+swift build "${NOCTBOARD_SWIFT_FLAGS[@]}"
+swift test "${NOCTBOARD_SWIFT_FLAGS[@]}"
+NOCTBOARD_RUN_RELAY_INTEGRATION=1 swift test "${NOCTBOARD_SWIFT_FLAGS[@]}" -c release
+swift run "${NOCTBOARD_SWIFT_FLAGS[@]}" -c release NoctBoardDemo
 git diff --check
