@@ -2574,7 +2574,7 @@ public actor NoctBoardClient {
                     let prepared = try await messagingClient.noctBoardPrepareGroupApplication(
                         groupEvent,
                         additionalRouteSet: additionalRouteSet,
-                        at: date
+                        at: max(Date(), date)
                     )
                     operationID = prepared.transportOperationID
                 }
@@ -2585,7 +2585,7 @@ public actor NoctBoardClient {
                 let prepared = try await messagingClient.noctBoardPrepareGroupApplication(
                     groupEvent,
                     additionalRouteSet: additionalRouteSet,
-                    at: date
+                    at: max(Date(), date)
                 )
                 operationID = prepared.transportOperationID
             }

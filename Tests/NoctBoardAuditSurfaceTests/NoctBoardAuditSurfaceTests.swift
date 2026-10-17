@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import Foundation
+import Darwin
 import NoctBoardCore
 import NoctweaveCore
 import XCTest
@@ -37,6 +38,36 @@ final class NoctBoardAuditSurfaceTests: XCTestCase {
         XCTAssertNil(model.importedAudit)
     }
 
+    func testImporterRejectsNamedPipeWithoutWaitingForAWriter() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("noctboard-fifo-import-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pipe = root.appendingPathComponent("audit.jsonl")
+        XCTAssertEqual(Darwin.mkfifo(pipe.path, 0o600), 0)
+        let finished = expectation(description: "Unsupported input is rejected without blocking")
+        let reader = Task.detached {
+            defer { finished.fulfill() }
+            do {
+                _ = try NoctBoardImportedAudit.load(from: pipe)
+                return false
+            } catch NoctBoardAuditImportError.notBoundedRegularFile {
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        let result = await XCTWaiter.fulfillment(of: [finished], timeout: 1)
+        // Unblock the old implementation even when the expectation times out,
+        // so this regression never leaves a blocked reader behind.
+        let cleanup = Darwin.open(pipe.path, O_RDWR | O_NONBLOCK | O_CLOEXEC)
+        defer { if cleanup >= 0 { Darwin.close(cleanup) } }
+        let rejected = await reader.value
+        XCTAssertEqual(result, .completed)
+        XCTAssertTrue(rejected)
+    }
+
     func testImporterAcceptsExactAuditWithContainerAndHistoryEvidence() throws {
         let fixture = try makeFixture()
         let data = try NoctBoardAuditExporter.jsonLines(
@@ -54,10 +85,11 @@ final class NoctBoardAuditSurfaceTests: XCTestCase {
             ]
         )
 
-        let inspected = NoctBoardImportedAudit.inspect(
-            data: data,
-            sourceURL: URL(fileURLWithPath: "/tmp/noctboard-audit-surface.jsonl")
-        )
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("noctboard-valid-audit-\(UUID()).jsonl")
+        try data.write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let inspected = try NoctBoardImportedAudit.load(from: file)
         XCTAssertTrue(inspected.isStructurallyConsistent, inspected.errors.joined(separator: "\n"))
         XCTAssertEqual(inspected.acceptedCount, 1)
         XCTAssertEqual(inspected.containerRejectedCount, 1)

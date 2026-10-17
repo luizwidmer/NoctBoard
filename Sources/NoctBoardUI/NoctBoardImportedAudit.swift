@@ -44,7 +44,7 @@ public struct NoctBoardImportedAudit: @unchecked Sendable {
     public static func load(from sourceURL: URL) throws -> NoctBoardImportedAudit {
         let descriptor = sourceURL.withUnsafeFileSystemRepresentation { path -> Int32 in
             guard let path else { return -1 }
-            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
         }
         guard descriptor >= 0 else { throw NoctBoardAuditImportError.cannotOpen(errno) }
         defer { Darwin.close(descriptor) }

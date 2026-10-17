@@ -716,7 +716,7 @@ enum NoctBoardCLI {
     ) throws -> Data {
         let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
             guard let path else { return -1 }
-            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
         }
         guard descriptor >= 0 else {
             throw CLIError.cannotReadInputFile(path: url.path, code: errno)

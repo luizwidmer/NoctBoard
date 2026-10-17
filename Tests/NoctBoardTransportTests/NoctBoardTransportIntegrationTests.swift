@@ -565,7 +565,7 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
             relay: endpoint
         )
         let maintainedAt = NoctweaveRendezvousV2.canonicalTimestamp(
-            Date().addingTimeInterval(-2)
+            Date().addingTimeInterval(-60)
         )
         let created = try await client.createBoard(
             name: "Rotating board",
@@ -686,6 +686,58 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
                 .membershipRemovalRequiresAuditSegmentation
             )
         }
+
+        // Admission authorship can be older than the actual transport work.
+        // Keep signed event/anchor time stable, and start transport at wall time.
+        let member = try await makeClient(
+            named: "transport clock member",
+            file: root.appendingPathComponent("member.json"),
+            relay: endpoint
+        )
+        let authoredAt = maintainedAt.addingTimeInterval(3)
+        let request = try await member.prepareAdmission(
+            to: created.board,
+            invitationBindingDigest: Data(repeating: 0xD4, count: 32),
+            expiresAt: authoredAt.addingTimeInterval(3_600),
+            createdAt: authoredAt.addingTimeInterval(-1)
+        )
+        let transportStartedAt = NoctweaveRendezvousV2.canonicalTimestamp(Date())
+        XCTAssertLessThan(authoredAt, transportStartedAt)
+        let package = try await client.admit(request, createdAt: authoredAt)
+        XCTAssertEqual(package.anchor.issuedAt, authoredAt)
+        XCTAssertEqual(package.transition.commit.createdAt, authoredAt)
+
+        let admittedRuntime = try await headless.openGroupRuntime(groupID: created.board.groupID)
+        let admittedState = await admittedRuntime.snapshot()
+        let historyIDs = Set(package.historyManifest.map(\.historyGroupEventID))
+        XCTAssertEqual(historyIDs.count, 2)
+        let historyOperations = admittedState.outboundTransportOperations.filter {
+            $0.kind == .application && historyIDs.contains($0.logicalID)
+        }
+        XCTAssertEqual(historyOperations.count, historyIDs.count)
+        for operation in historyOperations {
+            XCTAssertGreaterThanOrEqual(operation.createdAt, transportStartedAt)
+        }
+        let historyEvents = admittedState.events.filter { historyIDs.contains($0.id) }
+        XCTAssertEqual(historyEvents.count, historyIDs.count)
+        XCTAssertTrue(historyEvents.allSatisfy { $0.createdAt == authoredAt })
+        let historyBytes = try NoctweaveCoder.encode(historyOperations, sortedKeys: true)
+
+        let recoveredPackage = try await client.admit(request, createdAt: Date())
+        XCTAssertTrue(
+            try NoctBoardAdmissionCodec.encodePackage(recoveredPackage)
+                == NoctBoardAdmissionCodec.encodePackage(package),
+            "an exact admission retry must preserve the original package"
+        )
+        let recoveredRuntime = try await headless.openGroupRuntime(groupID: created.board.groupID)
+        let recoveredState = await recoveredRuntime.snapshot()
+        let recoveredHistoryOperations = recoveredState.outboundTransportOperations.filter {
+            $0.kind == .application && historyIDs.contains($0.logicalID)
+        }
+        XCTAssertTrue(
+            try NoctweaveCoder.encode(recoveredHistoryOperations, sortedKeys: true) == historyBytes,
+            "an exact retry must preserve the persisted history operations and packet artifacts"
+        )
     }
 
     func testHumanAndAgentsConvergeWhileUnrelatedSwarmCannotCrossBind() async throws {
