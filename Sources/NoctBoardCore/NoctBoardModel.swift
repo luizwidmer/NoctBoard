@@ -536,6 +536,12 @@ public enum NoctBoardOperation: Equatable {
     case transitionTask(NoctBoardTransitionTask)
     case postMessage(NoctBoardPostMessage)
     case setRole(NoctBoardSetRole)
+    case policyCheckpointV2(NoctBoardPolicyCheckpointV2)
+
+    public var isLegacyRoleChange: Bool {
+        if case .setRole = self { return true }
+        return false
+    }
 
     public var type: String {
         switch self {
@@ -546,6 +552,7 @@ public enum NoctBoardOperation: Equatable {
         case .transitionTask: "task.transition"
         case .postMessage: "message.post"
         case .setRole: "member.set-role"
+        case .policyCheckpointV2: "policy.checkpoint-v2"
         }
     }
 
@@ -558,6 +565,7 @@ public enum NoctBoardOperation: Equatable {
         case .transitionTask(let payload): payload.isStructurallyValid
         case .postMessage(let payload): payload.isStructurallyValid
         case .setRole(let payload): payload.isStructurallyValid
+        case .policyCheckpointV2(let payload): payload.isStructurallyValid
         }
     }
 }
@@ -584,6 +592,10 @@ extension NoctBoardOperation: Codable {
             self = .postMessage(try values.decode(NoctBoardPostMessage.self, forKey: .payload))
         case "member.set-role":
             self = .setRole(try values.decode(NoctBoardSetRole.self, forKey: .payload))
+        case "policy.checkpoint-v2":
+            self = .policyCheckpointV2(try values.decode(
+                NoctBoardPolicyCheckpointV2.self, forKey: .payload
+            ))
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .type,
@@ -605,6 +617,7 @@ extension NoctBoardOperation: Codable {
         case .transitionTask(let payload): try values.encode(payload, forKey: .payload)
         case .postMessage(let payload): try values.encode(payload, forKey: .payload)
         case .setRole(let payload): try values.encode(payload, forKey: .payload)
+        case .policyCheckpointV2(let payload): try values.encode(payload, forKey: .payload)
         }
     }
 }
@@ -612,6 +625,7 @@ extension NoctBoardOperation: Codable {
 /// The immutable application event carried inside a Noctweave group message.
 public struct NoctBoardEvent: Codable, Equatable, Identifiable {
     public static let currentSchema = "org.noctboard/event:1.0"
+    public static let verifiedSchema = "org.noctboard/event:2.0"
 
     public let schema: String
     public let id: UUID
@@ -673,7 +687,7 @@ public struct NoctBoardEvent: Codable, Equatable, Identifiable {
     }
 
     public var isStructurallyValid: Bool {
-        schema == Self.currentSchema
+        (schema == Self.currentSchema || schema == Self.verifiedSchema)
             && id.isNoctBoardValid
             && clientTransactionID.isNoctBoardValid
             && boardID.isNoctBoardValid
@@ -687,6 +701,10 @@ public struct NoctBoardEvent: Codable, Equatable, Identifiable {
             && createdAtUnixMilliseconds >= NoctBoardLimits.earliestTimestampMilliseconds
             && createdAtUnixMilliseconds <= NoctBoardLimits.latestTimestampMilliseconds
             && operation.isStructurallyValid
+            && (schema == Self.verifiedSchema
+                || { if case .policyCheckpointV2 = operation { return false }; return true }())
+            && (schema == Self.currentSchema
+                || { if case .setRole = operation { return false }; return true }())
     }
 
     public init(from decoder: Decoder) throws {

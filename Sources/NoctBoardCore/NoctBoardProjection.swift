@@ -163,10 +163,43 @@ public enum NoctBoardProjector {
         events: [NoctBoardEvent],
         configuration: NoctBoardConfiguration
     ) throws -> NoctBoardProjectionResult {
+        try replay(
+            events: events,
+            configuration: configuration,
+            verifiedOrder: false,
+            trustedCheckpointIDs: []
+        )
+    }
+
+    /// The transport adapter supplies this order only after Core receipts,
+    /// owner signatures, and durable checkpoint bindings have been checked.
+    /// This entry point never promotes an unbound policy event to authority.
+    package static func projectVerifiedOrder(
+        events: [NoctBoardEvent],
+        configuration: NoctBoardConfiguration,
+        trustedCheckpointIDs: Set<UUID>
+    ) throws -> NoctBoardProjectionResult {
+        try replay(
+            events: events,
+            configuration: configuration,
+            verifiedOrder: true,
+            trustedCheckpointIDs: trustedCheckpointIDs
+        )
+    }
+
+    private static func replay(
+        events: [NoctBoardEvent],
+        configuration: NoctBoardConfiguration,
+        verifiedOrder: Bool,
+        trustedCheckpointIDs: Set<UUID>
+    ) throws -> NoctBoardProjectionResult {
         guard configuration.isStructurallyValid else {
             throw NoctBoardProjectionError.invalidConfiguration
         }
-        guard events.count <= NoctBoardLimits.maximumBoardEvents else {
+        let limit = verifiedOrder
+            ? NoctweaveArchitectureV2.groupEventRecentWindow
+            : NoctBoardLimits.maximumBoardEvents
+        guard events.count <= limit else {
             throw NoctBoardProjectionError.eventLimitExceeded
         }
 
@@ -174,6 +207,13 @@ public enum NoctBoardProjector {
         ordered.reserveCapacity(events.count)
         for event in events {
             guard event.isStructurallyValid else {
+                throw NoctBoardProjectionError.invalidEvent(event.id)
+            }
+            if !verifiedOrder && event.schema != NoctBoardEvent.currentSchema {
+                throw NoctBoardProjectionError.invalidEvent(event.id)
+            }
+            if case .policyCheckpointV2 = event.operation,
+               !verifiedOrder || !trustedCheckpointIDs.contains(event.id) {
                 throw NoctBoardProjectionError.invalidEvent(event.id)
             }
             let digest = try NoctBoardCodec.digest(event)
@@ -186,7 +226,7 @@ public enum NoctBoardProjector {
             )
         }
 
-        ordered.sort(by: deterministicOrder)
+        if !verifiedOrder { ordered.sort(by: deterministicOrder) }
 
         var members = Dictionary(
             uniqueKeysWithValues: configuration.members.map { ($0.memberHandle, $0) }
@@ -308,7 +348,8 @@ public enum NoctBoardProjector {
                 members: &members,
                 threads: &threads,
                 tasks: &tasks,
-                messages: &messages
+                messages: &messages,
+                trustedPolicyCheckpoint: trustedCheckpointIDs.contains(event.id)
             ) {
                 append(
                     item,
@@ -344,6 +385,16 @@ public enum NoctBoardProjector {
         )
     }
 
+    package static func deterministicOrder(_ left: NoctBoardEvent, _ right: NoctBoardEvent) -> Bool {
+        if left.logicalClock != right.logicalClock {
+            return left.logicalClock < right.logicalClock
+        }
+        if left.createdAtUnixMilliseconds != right.createdAtUnixMilliseconds {
+            return left.createdAtUnixMilliseconds < right.createdAtUnixMilliseconds
+        }
+        return left.id.uuidString.lowercased() < right.id.uuidString.lowercased()
+    }
+
     private static func deterministicOrder(_ left: OrderedEvent, _ right: OrderedEvent) -> Bool {
         if left.event.logicalClock != right.event.logicalClock {
             return left.event.logicalClock < right.event.logicalClock
@@ -363,7 +414,8 @@ public enum NoctBoardProjector {
         members: inout [GroupScopedMemberHandleV2: NoctBoardMemberAuthorization],
         threads: inout [UUID: MutableThread],
         tasks: inout [UUID: MutableTask],
-        messages: inout [UUID: NoctBoardMessage]
+        messages: inout [UUID: NoctBoardMessage],
+        trustedPolicyCheckpoint: Bool
     ) -> NoctBoardRejectionReason? {
         switch event.operation {
         case .createThread(let payload):
@@ -505,6 +557,22 @@ public enum NoctBoardProjector {
             )
 
         case .setRole(let payload):
+            return applyRole(payload, author: author, members: &members, tasks: &tasks)
+        case .policyCheckpointV2(let checkpoint):
+            guard trustedPolicyCheckpoint,
+                  checkpoint.owner == author.memberHandle else { return .unauthorized }
+            guard let roleChange = checkpoint.roleChange else { return nil }
+            return applyRole(roleChange, author: author, members: &members, tasks: &tasks)
+        }
+        return nil
+    }
+
+    private static func applyRole(
+        _ payload: NoctBoardSetRole,
+        author: NoctBoardMemberAuthorization,
+        members: inout [GroupScopedMemberHandleV2: NoctBoardMemberAuthorization],
+        tasks: inout [UUID: MutableTask]
+    ) -> NoctBoardRejectionReason? {
             guard author.role == .coordinator else { return .unauthorized }
             guard let target = members[payload.memberHandle] else { return .unknownAuthor }
             guard target.role != payload.role else { return .noStateChange }
@@ -523,7 +591,6 @@ public enum NoctBoardProjector {
                 credentialHandle: target.credentialHandle,
                 role: payload.role
             )
-        }
         return nil
     }
 

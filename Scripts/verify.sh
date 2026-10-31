@@ -14,7 +14,7 @@ if (( $# > 1 )) || [[ $# == 1 && "${1:-}" != "--offline" ]]; then
   exit 2
 fi
 
-NOCTBOARD_EXPECTED_NOCTWEAVE_REVISION="7ffaff6b74d8ede577a130f1d88275a3066d0fd3"
+NOCTBOARD_EXPECTED_NOCTWEAVE_REVISION="7f873747447ba7c7b11d57cb9ccde63e47f20fa9"
 
 for NOCTBOARD_PIN_FILE in Package.swift Package.resolved; do
   if ! grep -Fq "${NOCTBOARD_EXPECTED_NOCTWEAVE_REVISION}" "${NOCTBOARD_PIN_FILE}"; then
@@ -48,6 +48,10 @@ fi
 
 swift build "${NOCTBOARD_SWIFT_FLAGS[@]}"
 swift test "${NOCTBOARD_SWIFT_FLAGS[@]}"
-NOCTBOARD_RUN_RELAY_INTEGRATION=1 swift test "${NOCTBOARD_SWIFT_FLAGS[@]}" -c release
+# Real relay fixtures use Core's plaintext-testing state store, which Core
+# deliberately refuses in release builds. Run every loopback path in debug,
+# then run the release-safe unit suites under production protection rules.
+NOCTBOARD_RUN_RELAY_INTEGRATION=1 swift test "${NOCTBOARD_SWIFT_FLAGS[@]}"
+NOCTBOARD_RUN_RELAY_INTEGRATION=0 swift test "${NOCTBOARD_SWIFT_FLAGS[@]}" -c release
 swift run "${NOCTBOARD_SWIFT_FLAGS[@]}" -c release NoctBoardDemo
 git diff --check

@@ -485,8 +485,8 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
             ),
             package
         )
-        XCTAssertEqual(package.anchor.baseState.epoch, 1)
-        XCTAssertEqual(package.transition.nextState.epoch, 2)
+        XCTAssertEqual(package.anchor.baseState.epoch, 2)
+        XCTAssertEqual(package.transition.nextState.epoch, 3)
         try assertStrictAdmissionArtifactRejectsUnknownAndDuplicateKeys(
             NoctBoardAdmissionCodec.encodeRequest(request),
             decode: NoctBoardAdmissionCodec.decodeRequest
@@ -495,9 +495,10 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
             NoctBoardAdmissionCodec.encodePackage(package),
             decode: NoctBoardAdmissionCodec.decodePackage
         )
-        XCTAssertEqual(package.historyManifest.map(\.eventID), [
-            created.initialPublication.event.id
-        ])
+        XCTAssertEqual(package.historyManifest.count, 2)
+        XCTAssertTrue(package.historyManifest.contains {
+            $0.eventID == created.initialPublication.event.id
+        })
         XCTAssertLessThanOrEqual(package.expiresAt, request.initialRouteSet.expiresAt)
         server.stop()
         do {
@@ -710,7 +711,7 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
         let admittedRuntime = try await headless.openGroupRuntime(groupID: created.board.groupID)
         let admittedState = await admittedRuntime.snapshot()
         let historyIDs = Set(package.historyManifest.map(\.historyGroupEventID))
-        XCTAssertEqual(historyIDs.count, 2)
+        XCTAssertEqual(historyIDs.count, rotatedSnapshot.events.count)
         let historyOperations = admittedState.outboundTransportOperations.filter {
             $0.kind == .application && historyIDs.contains($0.logicalID)
         }
@@ -1035,10 +1036,9 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
         trace("task-claimed")
         _ = try await agentB.synchronize()
 
-        // An admitted agent can submit an otherwise well-bound event with a
-        // near-maximum Lamport value. Core records the attempt as a logical
-        // clock gap without consuming its author chain; honest publication can
-        // therefore continue with a deterministic small next clock.
+        // An admitted agent can submit a well-bound v2 event with a
+        // near-maximum Lamport value. Its clock gap cannot consume its author chain;
+        // honest publication can continue with a deterministic small clock.
         let agentBBeforePoison = try await agentB.snapshot()
         let poisonDate = NoctweaveRendezvousV2.canonicalTimestamp(Date())
         let poisonOperation = NoctBoardOperation.postMessage(NoctBoardPostMessage(
@@ -1047,6 +1047,7 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
             body: "hostile clock advance"
         ))
         let poison = NoctBoardEvent(
+            schema: NoctBoardEvent.verifiedSchema,
             boardID: created.board.boardID,
             groupID: created.board.groupID,
             authorMemberHandle: agentBBeforePoison.localMemberHandle,
@@ -1173,11 +1174,17 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
         XCTAssertNotNil(audit.range(of: Data("unauthorizedHistoryBootstrap".utf8)))
         XCTAssertNotNil(audit.range(of: Data("invalidAuthorSignature".utf8)))
         XCTAssertNotNil(audit.range(of: Data("historyAttestation".utf8)))
-        XCTAssertNotNil(audit.range(of: Data("\"historyAttestationCount\":2".utf8)))
+        // First admission reasserts two records; its owner rebind adds a
+        // third record before the second admission reasserts all three.
+        XCTAssertEqual(ownerSnapshot.historyBootstrapProvenance.count, 5)
+        XCTAssertNotNil(audit.range(of: Data(
+            "\"historyAttestationCount\":\(ownerSnapshot.historyBootstrapProvenance.count)".utf8
+        )))
 
         // A separate red-swarm group can carry a payload that *claims* the
         // green IDs, but it has no green route or group credential. The green
-        // board never receives it, and the red product binding quarantines it.
+        // board never receives it. A malformed direct owner envelope on the
+        // red v2 board is ambiguous policy traffic and fails that board closed.
         let redHeadless = try await HeadlessMessagingClient.open(
             stateStore: ClientStateStore(
                 fileURL: root.appendingPathComponent("red.json"),
@@ -1233,6 +1240,11 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
             with: redHeadless,
             at: foreignHistoryDate
         )
+        let redAfterForeignHistory = try await red.snapshot()
+        XCTAssertTrue(redAfterForeignHistory.containerRejections.contains {
+            $0.groupEventID == foreignHistory.id
+                && $0.reason == .envelopeBindingMismatch
+        })
         let attackDate = redBase.addingTimeInterval(2)
         let claimedGreen = NoctBoardEvent(
             boardID: created.board.boardID,
@@ -1270,22 +1282,193 @@ final class NoctBoardTransportIntegrationTests: XCTestCase {
             at: attackDate
         )
         XCTAssertTrue(preparedAttack.complete)
-        let quarantinedRed = try await red.snapshot()
-        XCTAssertEqual(
-            quarantinedRed.containerRejections.last?.reason,
-            .envelopeBindingMismatch
-        )
-        let redAudit = try await red.auditJSONL()
-        XCTAssertNil(redAudit.range(of: Data(marker.utf8)))
-        XCTAssertNotNil(redAudit.range(of: Data("containerRejection".utf8)))
-        XCTAssertNotNil(redAudit.range(of: Data("envelopeBindingMismatch".utf8)))
-        XCTAssertNotNil(redAudit.range(of: Data("\"containerRejectedCount\":2".utf8)))
+        do {
+            _ = try await red.snapshot()
+            XCTFail("malformed owner policy traffic must fail the red board closed")
+        } catch NoctBoardVerifiedPolicyErrorV2.missingProof {
+        }
 
         let greenSynchronization = try await owner.synchronize()
         let greenAfterAttack = greenSynchronization.snapshot
         XCTAssertFalse(greenAfterAttack.events.contains { $0.id == claimedGreen.id })
         XCTAssertEqual(greenAfterAttack.projectionDigest, ownerSnapshot.projectionDigest)
         trace("cross-bind-rejected")
+    }
+
+    func testBoardCreationRecoversRootAfterMetadataEpochInterruption() async throws {
+        try requireRelayIntegration()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "noctboard-policy-root-recovery-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let endpoint = RelayEndpoint(host: "127.0.0.1", port: UInt16.random(in: 40_000 ... 57_000))
+        let server = RelayServer(store: RelayStore(), opaqueRouteStore: OpaqueRouteRelayStoreV2())
+        try server.start(host: "127.0.0.1", port: endpoint.port)
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        let stateFile = root.appendingPathComponent("owner.json")
+        let (owner, headless) = try await makeClientWithHeadless(
+            named: "root recovery owner", file: stateFile, relay: endpoint
+        )
+        let boardID = UUID()
+        let threadID = UUID()
+        let eventID = UUID()
+        let transactionID = UUID()
+        let createdAt = NoctweaveRendezvousV2.canonicalTimestamp(
+            Date().addingTimeInterval(-30)
+        )
+        await owner.setPolicyTestInterruption(.afterMetadataEpochBeforeRoot)
+        do {
+            _ = try await owner.createBoard(
+                name: "Recovered root", boardID: boardID,
+                initialThreadID: threadID, initialEventID: eventID,
+                initialClientTransactionID: transactionID,
+                createdAt: createdAt
+            )
+            XCTFail("Expected test interruption after metadata epoch")
+        } catch NoctBoardTransportError.publicationIncomplete(.pendingRetry) {
+        }
+        let before = await (try await headless.openGroupRuntime(groupID: boardID)).snapshot()
+        XCTAssertEqual(before.events.count, 1)
+        XCTAssertTrue(before.protectedApplicationVerificationBindings.isEmpty)
+        do {
+            _ = try await owner.snapshot()
+            XCTFail("Unpinned metadata root must fail closed")
+        } catch NoctBoardTransportError.verifiedPolicyRequired {
+        } catch NoctBoardTransportError.verifiedPolicyInvalid {
+        } catch NoctBoardVerifiedPolicyErrorV2.missingCheckpoint {
+        }
+
+        let reopened = try await makeClient(
+            named: "root recovery owner", file: stateFile, relay: endpoint
+        )
+        let recovered = try await reopened.recoverBoardCreation(
+            name: "Recovered root", boardID: boardID,
+            initialThreadID: threadID, initialEventID: eventID,
+            initialClientTransactionID: transactionID,
+            createdAt: createdAt
+        )
+        XCTAssertTrue(recovered.initialPublication.complete)
+        let after = try await reopened.snapshot()
+        XCTAssertEqual(after.events.filter { $0.id == eventID }.count, 1)
+        XCTAssertEqual(after.events.filter {
+            if case .policyCheckpointV2 = $0.operation { return true }
+            return false
+        }.count, 1)
+        let (_, reopenedHeadless) = try await makeClientWithHeadless(
+            named: "root recovery owner", file: stateFile, relay: endpoint
+        )
+        let durable = await (try await reopenedHeadless.openGroupRuntime(
+            groupID: boardID
+        )).snapshot()
+        XCTAssertEqual(durable.protectedApplicationVerificationBindings.count, 1)
+    }
+
+    func testVerifiedRoleCutoffRejectsBackdatedSenderAndSurvivesLateJoin() async throws {
+        try requireRelayIntegration()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "noctboard-policy-v2-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let port = UInt16.random(in: 40_000 ... 57_000)
+        let endpoint = RelayEndpoint(host: "127.0.0.1", port: port)
+        let server = RelayServer(store: RelayStore(), opaqueRouteStore: OpaqueRouteRelayStoreV2())
+        try server.start(host: "127.0.0.1", port: port)
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        let (owner, ownerHeadless) = try await makeClientWithHeadless(
+            named: "policy owner", file: root.appendingPathComponent("owner.json"), relay: endpoint
+        )
+        let (worker, workerHeadless) = try await makeClientWithHeadless(
+            named: "policy worker", file: root.appendingPathComponent("worker.json"), relay: endpoint
+        )
+        let base = NoctweaveRendezvousV2.canonicalTimestamp(Date().addingTimeInterval(-40))
+        let created = try await owner.createBoard(name: "Verified role policy", createdAt: base)
+        try await admit(
+            worker, to: owner, board: created.board, bindingByte: 0xA7,
+            at: NoctweaveRendezvousV2.canonicalTimestamp(Date())
+        )
+        trace("verified-v2-before-owner-sync")
+        _ = try await owner.synchronize()
+        trace("verified-v2-before-worker-sync")
+        _ = try await worker.synchronize()
+        trace("verified-v2-before-role-change")
+        let beforeCutoff = try await owner.snapshot()
+        let workerHandle = beforeCutoff.projection.members.first {
+            $0.memberHandle != beforeCutoff.localMemberHandle
+        }!.memberHandle
+        let downgrade = try await owner.publishVerifiedRoleChange(
+            NoctBoardSetRole(memberHandle: workerHandle, role: .auditor),
+            at: NoctweaveRendezvousV2.canonicalTimestamp(Date())
+        )
+        trace("verified-v2-before-worker-cutoff-sync")
+        try await requireComplete(downgrade, client: owner, at: Date())
+        _ = try await worker.synchronize()
+        let workerState = await (try await workerHeadless.openGroupRuntime(
+            groupID: created.board.groupID
+        )).snapshot()
+        let attackDate = NoctweaveRendezvousV2.canonicalTimestamp(Date())
+        let forged = NoctBoardEvent(
+            schema: NoctBoardEvent.verifiedSchema,
+            boardID: created.board.boardID,
+            groupID: created.board.groupID,
+            authorMemberHandle: workerState.localCredential.memberHandle,
+            authorCredentialHandle: workerState.localCredential.credentialHandle,
+            logicalClock: 0,
+            authorSequence: 0,
+            previousAuthorEventDigest: nil,
+            createdAtUnixMilliseconds: Int64(attackDate.timeIntervalSince1970 * 1_000),
+            operation: .postMessage(.init(
+                threadID: created.initialThreadID, body: "backdated after downgrade"
+            ))
+        )
+        try await sendRawGroupEvent(GroupConversationEventV2(
+            id: forged.id,
+            clientTransactionID: forged.clientTransactionID,
+            groupID: created.board.groupID,
+            authorMemberHandle: forged.authorMemberHandle,
+            authorCredentialHandle: forged.authorCredentialHandle,
+            createdAt: attackDate,
+            kind: .application,
+            content: try signedEventContent(
+                forged, signingKey: workerState.localCredential.signingKey
+            )
+        ), with: workerHeadless, at: attackDate)
+        trace("verified-v2-before-owner-attack-sync")
+        let afterAttack = try await owner.synchronize().snapshot
+        XCTAssertNil(afterAttack.projection.message(id: {
+            guard case .postMessage(let message) = forged.operation else { return UUID() }
+            return message.messageID
+        }()))
+        XCTAssertEqual(afterAttack.ledger.entries.last(where: { $0.eventID == forged.id })?.rejectionReason,
+                       .unauthorized)
+
+        // The worker announced its replacement route after the metadata
+        // epoch. The owner must ingest it before the next admission fanout.
+        _ = try await owner.synchronize()
+
+        let lateJoiner = try await makeClient(
+            named: "late joiner", file: root.appendingPathComponent("late.json"), relay: endpoint
+        )
+        trace("verified-v2-before-late-admission")
+        try await admit(
+            lateJoiner, to: owner, board: created.board, bindingByte: 0xB8,
+            at: NoctweaveRendezvousV2.canonicalTimestamp(Date())
+        )
+        let lateSnapshot = try await lateJoiner.snapshot()
+        XCTAssertEqual(lateSnapshot.projection.members.first {
+            $0.memberHandle == workerHandle
+        }?.role, .auditor)
+        XCTAssertEqual(lateSnapshot.ledger.entries.last(where: { $0.eventID == forged.id })?.rejectionReason,
+                       .unauthorized)
+        let ownerRecord = await (try await ownerHeadless.openGroupRuntime(
+            groupID: created.board.groupID
+        )).snapshot()
+        XCTAssertFalse(ownerRecord.protectedApplicationVerificationBindings.isEmpty)
     }
 
     private func makeClient(

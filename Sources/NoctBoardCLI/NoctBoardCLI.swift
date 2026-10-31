@@ -106,7 +106,8 @@ enum NoctBoardCLI {
                 Darwin.exit(1)
             }
 
-        case "create-board", "snapshot", "sync", "relay-health",
+        case "create-board", "snapshot", "review-legacy-policy", "migrate-policy",
+             "sync", "relay-health",
              "create-thread", "close-thread", "post-message", "create-task",
              "claim-task", "assign-task", "transition-task", "set-role",
              "export-audit", "prepare-admission", "admit", "complete-admission",
@@ -130,6 +131,8 @@ enum NoctBoardCLI {
       noctboard inspect-audit PATH
       noctboard create-board LIVE_OPTIONS --name-file PATH --recovery PATH
       noctboard snapshot LIVE_BOARD_OPTIONS
+      noctboard review-legacy-policy LIVE_BOARD_OPTIONS
+      noctboard migrate-policy LIVE_BOARD_OPTIONS --approved-digest SHA256_HEX
       noctboard sync LIVE_BOARD_OPTIONS
       noctboard post-message LIVE_BOARD_OPTIONS --thread UUID --body-file PATH [--task UUID]
       noctboard create-task LIVE_BOARD_OPTIONS --thread UUID --title-file PATH [--details-file PATH]
@@ -150,6 +153,8 @@ enum NoctBoardCLI {
       inspect-audit           Check JSONL schema, ordering, digests, and summary counts.
       create-board            Create/recover a board using an owner-only recovery descriptor.
       snapshot                Emit the current local projection and decision ledger.
+      review-legacy-policy    Inspect a sender-clock legacy projection before owner approval.
+      migrate-policy          Owner-review and freeze exact legacy history under a v2 root.
       sync                    Fetch encrypted group events, then emit the new snapshot.
       relay-health            Check the explicitly configured relay endpoint.
       create-thread           Publish a coordinator thread using --title-file.
@@ -159,7 +164,7 @@ enum NoctBoardCLI {
       claim-task              Assign an unclaimed task to this local group member.
       assign-task             Assign a task to --assignee HANDLE, or --unassign it.
       transition-task         Move a task through an allowed explicit state transition.
-      set-role                Set --member HANDLE to coordinator, worker, or auditor.
+      set-role                Owner-publish a Core-bound role cutoff for --member HANDLE.
       maintain                Resume pending routes/transports and emit the maintenance report.
       resume-publication      Resume the exact durable bytes for --operation UUID.
       export-audit            Export the live board's redacted decision ledger.
@@ -199,10 +204,12 @@ enum NoctBoardCLI {
       the existing group/event or creates it if group creation never became durable. Keep the
       descriptor private until the initial publication is complete.
 
-      Every thread/message/task/role publish command accepts optional stable --event-id and
+      Every thread/message/task publish command accepts optional stable --event-id and
       --transaction-id UUIDs. Persist both IDs and the returned operationID. Retrying the same
       IDs and operation resumes matching durable bytes; resume-publication targets operationID
       directly. Reusing either ID for different content fails closed.
+      A v2 set-role checkpoint also accepts stable IDs, but an interrupted checkpoint must be
+      completed with resume-publication before any later role change.
 
     ROUTE LEASE
       Noctweave group receive routes lease for 6 hours. Run maintain at least every 5 hours;
@@ -224,8 +231,9 @@ enum NoctBoardCLI {
     SECURITY SCOPE
       inspect-audit is a structural consistency check. A redacted audit does not contain
       the plaintext projection or enough material to replay the Noctweave group history.
-      Coordinator/worker/auditor roles constrain conforming clients only. For a malicious
-      admitted endpoint, credential removal plus epoch rotation is the future-write cutoff.
+      V2 roles are checked against owner-signed Core-bound frontier cutoffs. An admitted
+      endpoint remains able to submit ciphertext and read retained content; credential
+      removal plus epoch rotation is the future group-write cutoff.
       Diagnostics use stderr; JSON and JSONL machine output use stdout.
 
     LEGAL NOTICE
@@ -315,6 +323,19 @@ enum NoctBoardCLI {
             let client = try await openBoundClient(from: &options)
             try options.requireEmpty()
             try writeJSON(SnapshotOutput(try await client.snapshot()))
+
+        case "review-legacy-policy":
+            let client = try await openBoundClient(from: &options)
+            try options.requireEmpty()
+            try writeJSON(SnapshotOutput(try await client.legacyPolicyReview()))
+
+        case "migrate-policy":
+            let approvedDigest = try options.require("--approved-digest")
+            let client = try await openBoundClient(from: &options)
+            try options.requireEmpty()
+            try writeJSON(PublishOutput(try await client.migrateVerifiedPolicy(
+                approvingLegacyProjectionDigest: approvedDigest
+            )))
 
         case "sync":
             let client = try await openBoundClient(from: &options)
@@ -464,8 +485,8 @@ enum NoctBoardCLI {
             let identifiers = try publishIdentifiers(from: &options)
             let client = try await openBoundClient(from: &options)
             try options.requireEmpty()
-            try writeJSON(PublishOutput(try await client.publish(
-                .setRole(NoctBoardSetRole(memberHandle: member, role: role)),
+            try writeJSON(PublishOutput(try await client.publishVerifiedRoleChange(
+                NoctBoardSetRole(memberHandle: member, role: role),
                 eventID: identifiers.eventID,
                 clientTransactionID: identifiers.transactionID
             )))

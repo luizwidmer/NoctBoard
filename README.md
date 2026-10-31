@@ -35,7 +35,7 @@ Requirements: Swift 6, macOS 14 or later, and Apple silicon (`arm64`). The
 pinned Noctweave dependency currently supplies `liboqs.xcframework` only for
 `macos-arm64`; Intel and universal builds are not supported. The default
 package dependency is the inspected public Noctweave revision
-`7ffaff6b74d8ede577a130f1d88275a3066d0fd3`. Start from a source checkout:
+`7f873747447ba7c7b11d57cb9ccde63e47f20fa9`. Start from a source checkout:
 
 ```sh
 git clone https://github.com/luizwidmer/NoctBoard.git
@@ -151,14 +151,22 @@ their board-scoped handle and must independently enforce local tool policy.
 ### Known limitations
 
 - An admitted endpoint can copy every plaintext it is allowed to read.
-- Application roles are honest-client/advisory controls, not a cryptographic
-  revocation boundary. Projection order includes sender-supplied Lamport/event
-  fields, so a malicious, currently admitted raw endpoint may backdate a valid
-  signed write around an application-role downgrade. Group credential removal
-  and epoch rotation are required to stop future writes. Noctweave exposes that
-  lower-level path, but using it deliberately terminates the usable v1 board
-  segment: later snapshot, publish, and audit calls fail closed, with no
-  recovery in this version.
+- Newly created boards pin an owner-signed v2 policy root to authenticated
+  Noctweave sender frontiers. A role change is another owner-signed, Core-bound
+  checkpoint, so a later sender-controlled clock cannot place a write before
+  the downgrade. Existing v1 boards require an explicit owner review of their
+  current projection digest and an in-place metadata epoch/root migration;
+  normal board APIs fail closed if legacy role changes are present before that
+  root. Already accepted v1 history cannot be retroactively proved to have had
+  a trustworthy cross-sender order. Roles govern the board projection; only
+  group credential removal and epoch rotation stop an admitted endpoint from
+  submitting new ciphertext or reading content still available to it.
+- Migration checks for 16 MiB of free space within Core's 32 MiB durable group
+  record before changing metadata. A count-valid 3,000-event board with a large
+  encoded record can therefore receive `verifiedPolicyCapacityExceeded` and
+  remain on v1 until the owner can reduce Core storage pressure. This early
+  check cannot guarantee the later epoch journal and root append will fit;
+  after an interruption, Board APIs stay closed until root recovery succeeds.
 - V1 has a hard 3,000-event auditable window. Honest clients refuse further
   writes before runtime compaction. If an admitted bypass client forces
   compaction/overflow, snapshot fails explicitly because v1 has no checkpoint
@@ -173,6 +181,15 @@ their board-scoped handle and must independently enforce local tool policy.
   event. Each wrapper also consumes the 3,000-event window, so repeated
   admissions have quadratic retention cost and this is intentionally a
   small-swarm evaluation design.
+- A v2 late join also needs a fresh owner snapshot pinned to the new epoch
+  after history re-encryption; the joiner stays read-only until it verifies
+  that root. Histories above 128 retained application records cannot admit a
+  new member under the current bounded package format. An interrupted root
+  or a missing original record fails closed instead of restoring an older role.
+  An admitted raw Core group member can fill the 3,072-event recent window
+  outside Board's API and evict older direct records. Digest-only projection
+  then fails closed, causing an availability loss until an authenticated
+  archive or Core retention policy is available.
 - Crash-safe admission journals and join receipts live beside the client-state
   file in `<state-path>.noctboard-private/admission-state.json`. Preserve and
   move that private directory with the state file. It is encrypted by default,
@@ -198,6 +215,8 @@ their board-scoped handle and must independently enforce local tool policy.
   are unkeyed: they can confirm
   offline guesses of low-entropy titles, messages, or task text. Protect audit
   exports and separately shared digests like board data despite text redaction.
+  V2 policy checks run against the local encrypted group runtime before export;
+  the JSONL alone does not carry Core receipt or frontier proof.
 - Relays and network observers can see endpoint, timing, size, and frequency
   metadata. No anonymity claim is made.
 - Noct Board does not sandbox agent processes or hold their service/tool
@@ -229,6 +248,7 @@ crash-safe publication, admission, and lease maintenance.
 | [CLI and admission guide](CLI_GUIDE.md) | Operate a live board and preserve private state |
 | [Architecture](docs/architecture.md) | Application and transport boundaries |
 | [Protocol v1](docs/protocol-v1.md) | Typed events and canonical data |
+| [Verified policy v2](docs/verified-policy-v2.md) | Owner checkpoints and authenticated role cutoffs |
 | [Threat model](docs/threat-model.md) | Authorization and retained-history limits |
 | [Audit model](docs/audit-model.md) | What exported evidence can and cannot prove |
 | [Fixtures](fixtures/v1/README.md) | Deterministic example projection and audit |

@@ -2,6 +2,12 @@
 
 Status: pre-1.0, implemented for evaluation.
 
+Role changes in this legacy schema use sender-controlled ordering and are no
+longer accepted as a live policy boundary. Newly created boards use the
+[verified v2 policy](verified-policy-v2.md); an existing v1 board with role
+history stays read-only until its immutable Core owner reviews and binds its
+exact retained history under a v2 root in the same group.
+
 ## Noctweave binding
 
 The direct application content type is `org.noctboard/event:1.0`; bounded
@@ -226,3 +232,13 @@ Noctweave's tighter group, packet, route, runtime, and state-store limits also
 apply. If an admitted bypass client forces runtime compaction/overflow,
 snapshot fails because v1 has no checkpoint/base-state recovery. This protocol
 never relaxes Noctweave's limits.
+
+# Verified policy migration limits
+
+V2 in-place owner migration is described in [verified-policy-v2.md](verified-policy-v2.md).
+It checks for 16 MiB of durable Core record headroom before rotating metadata;
+some v1 boards within the 3,000-event count limit cannot migrate if their
+encoded state is too large. The error is `verifiedPolicyCapacityExceeded` and
+the v1 metadata remains intact. The later Core persistence checks are still
+authoritative, and a post-rotation root interruption keeps Board closed until
+the exact root is recovered.

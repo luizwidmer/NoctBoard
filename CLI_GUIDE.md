@@ -51,17 +51,42 @@ a relay access password.
 
 `create-board` writes the exclusive mode-`0600` recovery descriptor before any
 group mutation. It contains the protected initial title plus stable board,
-thread, event, and transaction identifiers. Re-run the same command after a
-crash or relay failure; it resumes the existing exact event or creates the
-group if creation never became durable. Keep the file private until the initial
-publication reports complete.
+thread, event, and transaction identifiers. Creation commits a v2 metadata
+epoch and pins an owner-signed policy root before reporting success. Re-run
+the same command after a crash or relay failure; it resumes the exact initial
+event or pending root, or creates the group if creation never became durable.
+Keep the file private until the initial publication reports complete.
 
-Every explicit thread/message/task/role publish accepts stable `--event-id`
+Every explicit thread/message/task publish accepts stable `--event-id`
 and `--transaction-id` values. Persist those plus the returned `operationID`;
 retry matching IDs or use `resume-publication --operation UUID` to resume the
 exact durable bytes. Run `maintain` to resume pending route/transport work.
 Schedule `maintain` at least every five hours so the six-hour receive-route
 lease rotates before expiry.
+
+`set-role` uses an owner-signed v2 checkpoint bound to verified Core sender
+frontiers. It accepts stable IDs, but use `resume-publication` to finish an
+interrupted checkpoint before requesting another role change. A member's
+backdated logical clock cannot move a later write before this checkpoint.
+
+For a board created by an older v1 release, review the legacy projection and
+its digest before switching the same group to verified policy:
+
+```sh
+swift run noctboard review-legacy-policy LIVE_BOARD_OPTIONS
+swift run noctboard migrate-policy LIVE_BOARD_OPTIONS \
+  --approved-digest REVIEWED_PROJECTION_SHA256_HEX
+```
+
+The owner must compare the full review with its intended Board state. The
+migration recomputes the exact retained signed event set under a mutation
+lease, changes group metadata in place, and pins the owner root. Existing v1
+role history is read-only until that succeeds. The root is an explicit owner
+attestation of legacy order, not retroactive proof of sender clocks. If a
+checkpoint publication is interrupted, use its `operationID` with
+`resume-publication` or retry `migrate-policy` with the same reviewed digest.
+All active members should upgrade before migration; old clients reject the
+new metadata. Admission remains capped at 128 retained Board records.
 
 The create result returns the v1 board UUID; the Noctweave group UUID is the
 same value. Joining another agent is an explicit three-step, two-artifact

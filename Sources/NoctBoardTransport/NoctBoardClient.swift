@@ -246,6 +246,11 @@ public enum NoctBoardTransportError: Error, Equatable {
     case groupRoleChangeRequiresAuditSegmentation
     case groupPermissionChangeRequiresAuditSegmentation
     case groupCapabilityChangeRequiresAuditSegmentation
+    case verifiedPolicyRequired
+    case verifiedPolicyInvalid
+    case verifiedPolicyWindowExceeded
+    case verifiedPolicyCapacityExceeded
+    case verifiedPolicyOwnerRequired
     case logicalClockExhausted
     case authorSequenceExhausted
     case localAuthorizationRejected(NoctBoardRejectionReason?)
@@ -765,6 +770,10 @@ enum NoctBoardAdmissionTestInterruption: Equatable, Sendable {
     case afterEpochPackageJournaled
 }
 
+enum NoctBoardPolicyTestInterruption: Equatable, Sendable {
+    case afterMetadataEpochBeforeRoot
+}
+
 /// Strict NCJ-1 admission artifacts for the independently authenticated
 /// invitation channel. Raw JSONDecoder is intentionally not part of this API:
 /// duplicate keys, whitespace variants, and dropped unknown fields fail.
@@ -862,6 +871,7 @@ public actor NoctBoardClient {
     private let relayAccessPassword: String?
     private var boundBoard: NoctBoardReference?
     private var admissionTestInterruption: NoctBoardAdmissionTestInterruption?
+    private var policyTestInterruption: NoctBoardPolicyTestInterruption?
 
     init(
         messagingClient: HeadlessMessagingClient,
@@ -876,12 +886,19 @@ public actor NoctBoardClient {
         self.relayAccessPassword = relayAccessPassword
         self.boundBoard = board
         self.admissionTestInterruption = nil
+        self.policyTestInterruption = nil
     }
 
     func setAdmissionTestInterruption(
         _ interruption: NoctBoardAdmissionTestInterruption?
     ) {
         admissionTestInterruption = interruption
+    }
+
+    func setPolicyTestInterruption(
+        _ interruption: NoctBoardPolicyTestInterruption?
+    ) {
+        policyTestInterruption = interruption
     }
 
     public static func open(
@@ -1030,11 +1047,31 @@ public actor NoctBoardClient {
         boundBoard = board
 
         do {
-            let initialPublication = try await publish(
+            var initialPublication = try await publish(
                 .createThread(initialThread),
                 eventID: initialEventID,
                 clientTransactionID: initialClientTransactionID,
                 createdAt: canonicalDate
+            )
+            guard initialPublication.complete else {
+                throw NoctBoardTransportError.publicationIncomplete(
+                    initialPublication.disposition
+                )
+            }
+            let reviewed = try await legacyPolicyReview()
+            let root = try await migrateVerifiedPolicy(
+                approvingLegacyProjectionDigest: reviewed.projectionDigest,
+                at: canonicalDate
+            )
+            guard root.complete else {
+                throw NoctBoardTransportError.publicationIncomplete(root.disposition)
+            }
+            initialPublication = NoctBoardPublishResult(
+                event: initialPublication.event,
+                operationID: initialPublication.operationID,
+                complete: true,
+                disposition: .complete,
+                projectionDigest: root.projectionDigest
             )
             return NoctBoardCreationResult(
                 board: board,
@@ -1088,12 +1125,79 @@ public actor NoctBoardClient {
             }
         }
 
-        let initialPublication = try await publish(
+        let preflightRuntime = try await messagingClient.openGroupRuntime(groupID: board.groupID)
+        let preflightState = await preflightRuntime.snapshot()
+        if Self.hasVerifiedPolicyMetadata(board: board, signedState: preflightState.signedState) {
+            try await pinReceivedPolicyCheckpoints(
+                board: board, at: Self.canonicalDate(Date())
+            )
+            let settled = await (try await messagingClient.openGroupRuntime(
+                groupID: board.groupID
+            )).snapshot()
+            let extracted = Self.extractBoardEvents(
+                settled.events, board: board, signedState: settled.signedState
+            )
+            if !extracted.events.contains(where: {
+                if case .policyCheckpointV2 = $0.operation { return true }
+                return false
+            }) {
+                // Core may have committed the metadata epoch before the
+                // owner root was prepared. Reconstruct only the exact
+                // one-event creation history, then finish that root.
+                guard extracted.events.count == 1,
+                      extracted.events[0].id == initialEventID,
+                      extracted.events[0].clientTransactionID
+                        == initialClientTransactionID,
+                      extracted.events[0].operation == .createThread(initialThread) else {
+                    throw NoctBoardTransportError.verifiedPolicyInvalid
+                }
+                let configuration = try Self.boardConfiguration(
+                    board: board, signedState: settled.signedState
+                )
+                let reviewed = try NoctBoardProjector.project(
+                    events: extracted.events, configuration: configuration
+                )
+                let root = try await migrateVerifiedPolicy(
+                    approvingLegacyProjectionDigest: reviewed.projectionDigest,
+                    at: Self.canonicalDate(Date())
+                )
+                guard root.complete else {
+                    throw NoctBoardTransportError.publicationIncomplete(root.disposition)
+                }
+            }
+        }
+        var initialPublication = try await publish(
             .createThread(initialThread),
             eventID: initialEventID,
             clientTransactionID: initialClientTransactionID,
             createdAt: createdAt
         )
+        guard initialPublication.complete else {
+            throw NoctBoardTransportError.publicationIncomplete(
+                initialPublication.disposition
+            )
+        }
+        let migrationState = await (try await messagingClient.openGroupRuntime(
+            groupID: board.groupID
+        )).snapshot()
+        if !Self.hasVerifiedPolicyMetadata(board: board, signedState: migrationState.signedState),
+           migrationState.events.count == 1 {
+            let reviewed = try await legacyPolicyReview()
+            let root = try await migrateVerifiedPolicy(
+                approvingLegacyProjectionDigest: reviewed.projectionDigest,
+                at: Self.canonicalDate(Date())
+            )
+            guard root.complete else {
+                throw NoctBoardTransportError.publicationIncomplete(root.disposition)
+            }
+            initialPublication = NoctBoardPublishResult(
+                event: initialPublication.event,
+                operationID: initialPublication.operationID,
+                complete: true,
+                disposition: .complete,
+                projectionDigest: root.projectionDigest
+            )
+        }
         let runtime = try await messagingClient.openGroupRuntime(groupID: board.groupID)
         let localCredential = await runtime.snapshot().localCredential
         return NoctBoardCreationResult(
@@ -1117,6 +1221,14 @@ public actor NoctBoardClient {
         guard operation.isStructurallyValid else {
             throw NoctBoardTransportError.invalidBoardContainer
         }
+        if operation.isLegacyRoleChange {
+            throw NoctBoardTransportError.verifiedPolicyRequired
+        }
+        if case .policyCheckpointV2 = operation {
+            // A checkpoint must be built from the local Core heads, delivered,
+            // then bound to the exact heads by Core before it grants policy.
+            throw NoctBoardTransportError.verifiedPolicyRequired
+        }
         let board = try requiredBoard()
         try await requireBoardAccessVerified(board)
         let mutationLease = try await acquireBoardMutationLease()
@@ -1128,18 +1240,36 @@ public actor NoctBoardClient {
             board: board,
             signedState: groupState.signedState
         )
-        try Self.enforceAuditWindow(groupEventCount: groupState.events.count)
+        try Self.enforceAuditWindow(
+            groupEventCount: groupState.events.count,
+            limit: Self.auditWindowLimit(board: board, signedState: groupState.signedState)
+        )
         let extracted = Self.extractBoardEvents(
             groupState.events,
             board: board,
             signedState: groupState.signedState
         )
-        let projection = try NoctBoardProjector.project(
-            events: extracted.events,
-            configuration: configuration
-        )
+        let projection: NoctBoardProjectionResult
+        let verifiedPolicy: NoctBoardVerifiedPolicyV2.VerifiedResult?
+        if Self.hasVerifiedPolicyMetadata(board: board, signedState: groupState.signedState) {
+            verifiedPolicy = try NoctBoardVerifiedPolicyV2.project(
+                record: groupState,
+                board: board,
+                extracted: extracted.verifiedEvents,
+                configuration: configuration
+            )
+            projection = verifiedPolicy!.result
+        } else {
+            verifiedPolicy = nil
+            try Self.requireLegacyRoleSafety(extracted.events)
+            projection = try NoctBoardProjector.project(
+                events: extracted.events,
+                configuration: configuration
+            )
+        }
+        let projectableEvents = verifiedPolicy?.orderedEvents ?? extracted.events
 
-        if let existing = extracted.events.first(where: {
+        if let existing = projectableEvents.first(where: {
             $0.id == eventID || $0.clientTransactionID == clientTransactionID
         }) {
             guard existing.id == eventID,
@@ -1187,7 +1317,8 @@ public actor NoctBoardClient {
 
         try Self.enforceAuditWindow(
             groupEventCount: groupState.events.count,
-            reservingNewEvents: 1
+            reservingNewEvents: 1,
+            limit: Self.auditWindowLimit(board: board, signedState: groupState.signedState)
         )
         let consumed = projection.ledger.entries.filter(\.authorChainConsumed)
         guard let maximumClock = consumed.map(\.logicalClock).max() else {
@@ -1198,11 +1329,12 @@ public actor NoctBoardClient {
                 createdAt: createdAt,
                 board: board,
                 groupState: groupState,
-                existingEvents: extracted.events,
+                existingEvents: projectableEvents,
                 logicalClock: 0,
                 authorSequence: 0,
                 previousAuthorEventDigest: nil,
-                localCredential: localCredential
+                localCredential: localCredential,
+                verifiedPolicy: verifiedPolicy
             )
         }
         guard maximumClock < NoctBoardLimits.maximumLogicalInteger else {
@@ -1232,11 +1364,12 @@ public actor NoctBoardClient {
             createdAt: createdAt,
             board: board,
             groupState: groupState,
-            existingEvents: extracted.events,
+            existingEvents: projectableEvents,
             logicalClock: maximumClock + 1,
             authorSequence: nextSequence,
             previousAuthorEventDigest: previousDigest,
-            localCredential: localCredential
+            localCredential: localCredential,
+            verifiedPolicy: verifiedPolicy
         )
     }
 
@@ -1281,6 +1414,7 @@ public actor NoctBoardClient {
         guard !maintenance.requiresFollowUp, routeAnnouncementComplete != false else {
             throw NoctBoardTransportError.publicationIncomplete(.pendingRetry)
         }
+        try await pinReceivedPolicyCheckpoints(board: board, at: Self.canonicalDate(Date()))
         let current = try await snapshot()
         let receivedIDs = Set(receivedEventIDs)
         let receivedHistoryEventIDs = Set(current.historyBootstrapProvenance.compactMap {
@@ -1306,25 +1440,320 @@ public actor NoctBoardClient {
             board: board,
             signedState: groupState.signedState
         )
-        try Self.enforceAuditWindow(groupEventCount: groupState.events.count)
+        try Self.enforceAuditWindow(
+            groupEventCount: groupState.events.count,
+            limit: Self.auditWindowLimit(board: board, signedState: groupState.signedState)
+        )
         let extracted = Self.extractBoardEvents(
             groupState.events,
             board: board,
             signedState: groupState.signedState
         )
-        let result = try NoctBoardProjector.project(
-            events: extracted.events,
-            configuration: configuration
-        )
+        let result: NoctBoardProjectionResult
+        let verified: NoctBoardVerifiedPolicyV2.VerifiedResult?
+        if Self.hasVerifiedPolicyMetadata(board: board, signedState: groupState.signedState) {
+            verified = try NoctBoardVerifiedPolicyV2.project(
+                record: groupState,
+                board: board,
+                extracted: extracted.verifiedEvents,
+                configuration: configuration
+            )
+            result = verified!.result
+        } else {
+            verified = nil
+            try Self.requireLegacyRoleSafety(extracted.events)
+            result = try NoctBoardProjector.project(
+                events: extracted.events,
+                configuration: configuration
+            )
+        }
+        let quarantinedIDs = verified?.quarantinedOuterIDs ?? []
+        let priorRejectionIDs = Set(extracted.rejections.map(\.groupEventID))
+        let quarantine = quarantinedIDs.subtracting(priorRejectionIDs)
+            .sorted { $0.uuidString < $1.uuidString }.map {
+            NoctBoardContainerRejection(groupEventID: $0, reason: .unexpectedContent)
+        }
         return NoctBoardClientSnapshot(
             board: board,
             groupEpoch: groupState.signedState.epoch,
             localMemberHandle: groupState.localCredential.memberHandle,
             localCredentialHandle: groupState.localCredential.credentialHandle,
+            events: verified?.orderedEvents ?? extracted.events,
+            historyBootstrapProvenance: extracted.historyBootstrapProvenance.filter {
+                !quarantinedIDs.contains($0.groupEventID)
+            },
+            containerRejections: extracted.rejections + quarantine,
+            result: result
+        )
+    }
+
+    /// Read-only review of a legacy board before the immutable Core owner
+    /// explicitly freezes its exact event set under a verified policy root.
+    /// The returned role ordering is sender-clock based and is not authority
+    /// for another publication or a current policy claim.
+    public func legacyPolicyReview() async throws -> NoctBoardClientSnapshot {
+        let board = try requiredBoard()
+        try await requireBoardAccessVerified(board)
+        let runtime = try await messagingClient.openGroupRuntime(groupID: board.groupID)
+        let state = await runtime.snapshot()
+        guard !Self.hasVerifiedPolicyMetadata(board: board, signedState: state.signedState) else {
+            throw NoctBoardTransportError.verifiedPolicyInvalid
+        }
+        let configuration = try Self.boardConfiguration(
+            board: board, signedState: state.signedState
+        )
+        try Self.enforceAuditWindow(groupEventCount: state.events.count)
+        let extracted = Self.extractBoardEvents(
+            state.events, board: board, signedState: state.signedState
+        )
+        let result = try NoctBoardProjector.project(
+            events: extracted.events, configuration: configuration
+        )
+        return NoctBoardClientSnapshot(
+            board: board,
+            groupEpoch: state.signedState.epoch,
+            localMemberHandle: state.localCredential.memberHandle,
+            localCredentialHandle: state.localCredential.credentialHandle,
             events: extracted.events,
             historyBootstrapProvenance: extracted.historyBootstrapProvenance,
             containerRejections: extracted.rejections,
             result: result
+        )
+    }
+
+    /// The immutable Core owner reviews the legacy projection digest and
+    /// freezes its exact signed history under a Core-bound current-epoch root.
+    /// A v1 role history is deliberately read-only until this succeeds.
+    public func migrateVerifiedPolicy(
+        approvingLegacyProjectionDigest approvedDigest: String,
+        at date: Date = Date()
+    ) async throws -> NoctBoardPublishResult {
+        let board = try requiredBoard()
+        try await requireBoardAccessVerified(board)
+        let lease = try await acquireBoardMutationLease()
+        defer { lease.release() }
+        let canonicalDate = Self.canonicalDate(date)
+        var runtime = try await messagingClient.openGroupRuntime(groupID: board.groupID)
+        var state = await runtime.snapshot()
+        try Self.requirePolicyOwner(state)
+        let configuration = try Self.boardConfiguration(
+            board: board, signedState: state.signedState
+        )
+        try Self.enforceAuditWindow(
+            groupEventCount: state.events.count,
+            limit: Self.auditWindowLimit(board: board, signedState: state.signedState)
+        )
+        let extracted = Self.extractBoardEvents(
+            state.events, board: board, signedState: state.signedState
+        )
+        let eventsBeforeMigration = state.events
+        let ownerRoots = extracted.verifiedEvents.compactMap { item
+            -> NoctBoardEvent? in
+            guard item.directOuterEventID == item.event.id,
+                  item.event.authorMemberHandle == state.localCredential.memberHandle,
+                  case .policyCheckpointV2(let checkpoint) = item.event.operation,
+                  checkpoint.kind == .snapshot,
+                  checkpoint.previousCheckpointDigest == nil else { return nil }
+            return item.event
+        }
+        guard ownerRoots.count <= 1 else {
+            throw NoctBoardTransportError.verifiedPolicyInvalid
+        }
+        let legacyEvents = extracted.events.filter {
+            $0.schema == NoctBoardEvent.currentSchema
+        }
+        guard !extracted.events.contains(where: {
+            $0.schema == NoctBoardEvent.verifiedSchema
+                && $0.authorMemberHandle == state.localCredential.memberHandle
+                && $0.id != ownerRoots.first?.id
+        }) else {
+            throw NoctBoardTransportError.verifiedPolicyInvalid
+        }
+        let reviewed = try NoctBoardProjector.project(
+            events: legacyEvents, configuration: configuration
+        )
+        guard reviewed.projectionDigest == approvedDigest else {
+            throw NoctBoardTransportError.admissionPlanStale
+        }
+        if let ownerRoot = ownerRoots.first {
+            guard Self.hasVerifiedPolicyMetadata(
+                board: board, signedState: state.signedState
+            ) else {
+                throw NoctBoardTransportError.verifiedPolicyInvalid
+            }
+            try await pinReceivedPolicyCheckpoints(board: board, at: canonicalDate)
+            state = await (try await messagingClient.openGroupRuntime(
+                groupID: board.groupID
+            )).snapshot()
+            let current = Self.extractBoardEvents(
+                state.events, board: board, signedState: state.signedState
+            )
+            let verified = try NoctBoardVerifiedPolicyV2.project(
+                record: state, board: board,
+                extracted: current.verifiedEvents,
+                configuration: configuration
+            )
+            return NoctBoardPublishResult(
+                event: ownerRoot,
+                operationID: state.outboundTransportOperations.first {
+                    $0.kind == .application && $0.logicalID == ownerRoot.id
+                }?.id,
+                complete: true,
+                disposition: .complete,
+                projectionDigest: verified.result.projectionDigest
+            )
+        }
+        let ordered = legacyEvents.sorted(by: NoctBoardProjector.deterministicOrder)
+        guard ordered.count < NoctweaveArchitectureV2.groupEventRecentWindow,
+              state.events.count < NoctweaveArchitectureV2.groupEventRecentWindow else {
+            throw NoctBoardTransportError.verifiedPolicyWindowExceeded
+        }
+        _ = try NoctBoardVerifiedPolicyV2.historyOrder(for: ordered)
+
+        if !Self.hasVerifiedPolicyMetadata(board: board, signedState: state.signedState) {
+            // Size-check the proposed epoch and the Board audit-window
+            // counter bound before Core commits the metadata epoch.
+            guard state.signedState.epoch < UInt64(Int64.max) else {
+                throw NoctBoardTransportError.invalidGroupState
+            }
+            let previewFrontiers = state.signedState.activeCredentials.map {
+                GroupApplicationVerificationFrontierV2(
+                    groupID: board.groupID,
+                    epoch: state.signedState.epoch + 1,
+                    transcriptHash: Data(repeating: 0, count: 32),
+                    credentialHandle: $0.credentialHandle,
+                    nextCounter: UInt64(NoctBoardLimits.maximumBoardEvents),
+                    prefixDigest: Data(repeating: 0, count: 32)
+                )
+            }.sorted { $0.credentialHandle.rawValue < $1.credentialHandle.rawValue }
+            let preview = try Self.policyCheckpointCandidate(
+                board: board, state: state, configuration: configuration,
+                orderedEvents: ordered, trustedCheckpointIDs: [],
+                kind: .snapshot, previousCheckpointDigest: nil,
+                roleChange: nil, frontiers: previewFrontiers, at: canonicalDate
+            )
+            try Self.preflightMigrationCapacity(
+                state: state, root: preview.event
+            )
+            guard let stateDigest = state.signedState.digest else {
+                throw NoctBoardTransportError.invalidGroupState
+            }
+            let idempotency = Data(SHA256.hash(data:
+                Data("org.noctboard.policy-migration.v2\0".utf8)
+                    + Data(board.boardID.uuidString.lowercased().utf8)
+                    + stateDigest + Data(approvedDigest.utf8)
+            ))
+            let prepared = try await messagingClient.prepareGroupEpoch(
+                groupID: board.groupID,
+                operation: .updateMetadata,
+                proposedMembers: state.signedState.members,
+                proposedCredentials: state.signedState.memberCredentials,
+                proposedPermissions: state.signedState.permissions,
+                proposedMetadataDigest: Self.verifiedBoardMetadataDigest(boardID: board.boardID),
+                idempotencyKey: idempotency,
+                createdAt: canonicalDate
+            )
+            if let transport = prepared.transportOperation {
+                let resumed = try await messagingClient.resumeGroupTransport(
+                    groupID: board.groupID,
+                    operationID: transport.id,
+                    at: canonicalDate
+                )
+                guard resumed.complete else {
+                    throw NoctBoardTransportError.publicationIncomplete(
+                        NoctBoardPublicationDisposition(resumed.disposition)
+                    )
+                }
+            }
+            runtime = try await messagingClient.openGroupRuntime(groupID: board.groupID)
+            state = await runtime.snapshot()
+            guard Self.hasVerifiedPolicyMetadata(board: board, signedState: state.signedState),
+                  state.events == eventsBeforeMigration else {
+                throw NoctBoardTransportError.admissionPlanStale
+            }
+            if policyTestInterruption == .afterMetadataEpochBeforeRoot {
+                policyTestInterruption = nil
+                throw NoctBoardTransportError.publicationIncomplete(.pendingRetry)
+            }
+        }
+        guard state.currentVerificationFrontiers() != nil else {
+            throw NoctBoardTransportError.verifiedPolicyRequired
+        }
+        return try await publishPolicyCheckpointUnderLease(
+            board: board, state: state, configuration: configuration,
+            orderedEvents: ordered, trustedCheckpointIDs: [],
+            kind: .snapshot, previousCheckpointDigest: nil,
+            roleChange: nil, at: canonicalDate
+        )
+    }
+
+    /// A role transition is an owner-signed, Core-bound policy boundary. The
+    /// caller cannot choose its position by setting an application clock.
+    public func publishVerifiedRoleChange(
+        _ change: NoctBoardSetRole,
+        eventID: UUID = UUID(),
+        clientTransactionID: UUID = UUID(),
+        at date: Date = Date()
+    ) async throws -> NoctBoardPublishResult {
+        guard change.isStructurallyValid else {
+            throw NoctBoardTransportError.invalidBoardContainer
+        }
+        let board = try requiredBoard()
+        try await requireBoardAccessVerified(board)
+        let lease = try await acquireBoardMutationLease()
+        defer { lease.release() }
+        let runtime = try await messagingClient.openGroupRuntime(groupID: board.groupID)
+        var state = await runtime.snapshot()
+        try Self.requirePolicyOwner(state)
+        guard Self.hasVerifiedPolicyMetadata(board: board, signedState: state.signedState) else {
+            throw NoctBoardTransportError.verifiedPolicyRequired
+        }
+        try await pinReceivedPolicyCheckpoints(board: board, at: Self.canonicalDate(date))
+        state = await (try await messagingClient.openGroupRuntime(
+            groupID: board.groupID
+        )).snapshot()
+        let configuration = try Self.boardConfiguration(
+            board: board, signedState: state.signedState
+        )
+        let extracted = Self.extractBoardEvents(
+            state.events, board: board, signedState: state.signedState
+        )
+        let verified = try NoctBoardVerifiedPolicyV2.project(
+            record: state, board: board,
+            extracted: extracted.verifiedEvents, configuration: configuration
+        )
+        if let existing = verified.orderedEvents.first(where: {
+            $0.id == eventID || $0.clientTransactionID == clientTransactionID
+        }) {
+            guard existing.id == eventID,
+                  existing.clientTransactionID == clientTransactionID,
+                  existing.authorMemberHandle == state.localCredential.memberHandle,
+                  existing.authorCredentialHandle == state.localCredential.credentialHandle,
+                  case .policyCheckpointV2(let checkpoint) = existing.operation,
+                  checkpoint.kind == .roleChange,
+                  checkpoint.roleChange == change else {
+                throw NoctBoardTransportError.localAuthorizationRejected(.eventIDConflict)
+            }
+            return NoctBoardPublishResult(
+                event: existing,
+                operationID: state.outboundTransportOperations.first {
+                    $0.kind == .application && $0.logicalID == existing.id
+                }?.id,
+                complete: true,
+                disposition: .complete,
+                projectionDigest: verified.result.projectionDigest
+            )
+        }
+        let previous = verified.latestCheckpointEvent
+        return try await publishPolicyCheckpointUnderLease(
+            board: board, state: state, configuration: configuration,
+            orderedEvents: verified.orderedEvents,
+            trustedCheckpointIDs: verified.trustedCheckpointIDs,
+            kind: .roleChange,
+            previousCheckpointDigest: try NoctBoardCodec.digest(previous),
+            roleChange: change, at: Self.canonicalDate(date),
+            eventID: eventID,
+            clientTransactionID: clientTransactionID
         )
     }
 
@@ -1464,12 +1893,38 @@ public actor NoctBoardClient {
             board: board,
             signedState: stateBeforeAdmission.signedState
         )
-        try Self.enforceAuditWindow(groupEventCount: stateBeforeAdmission.events.count)
-        let history = Self.extractBoardEvents(
+        let verifiedAdmission = Self.hasVerifiedPolicyMetadata(
+            board: board, signedState: stateBeforeAdmission.signedState
+        )
+        try Self.enforceAuditWindow(
+            groupEventCount: stateBeforeAdmission.events.count,
+            limit: Self.auditWindowLimit(
+                board: board, signedState: stateBeforeAdmission.signedState
+            )
+        )
+        let beforeExtraction = Self.extractBoardEvents(
             stateBeforeAdmission.events,
             board: board,
             signedState: stateBeforeAdmission.signedState
-        ).reassertableEvents
+        )
+        if Self.hasVerifiedPolicyMetadata(
+            board: board, signedState: stateBeforeAdmission.signedState
+        ) {
+            let configuration = try Self.boardConfiguration(
+                board: board, signedState: stateBeforeAdmission.signedState
+            )
+            let verified = try NoctBoardVerifiedPolicyV2.project(
+                record: stateBeforeAdmission, board: board,
+                extracted: beforeExtraction.verifiedEvents,
+                configuration: configuration
+            )
+            guard verified.orderedEvents.count < Self.maximumAdmissionHistoryEvents else {
+                throw NoctBoardTransportError.verifiedPolicyWindowExceeded
+            }
+        } else {
+            try Self.requireLegacyRoleSafety(beforeExtraction.events)
+        }
+        let history = beforeExtraction.reassertableEvents
         guard !history.isEmpty else {
             throw NoctBoardTransportError.admissionHistoryIncomplete
         }
@@ -1478,7 +1933,10 @@ public actor NoctBoardClient {
         }
         try Self.enforceAuditWindow(
             groupEventCount: stateBeforeAdmission.events.count,
-            reservingNewEvents: history.count
+            reservingNewEvents: history.count + (verifiedAdmission ? 1 : 0),
+            limit: Self.auditWindowLimit(
+                board: board, signedState: stateBeforeAdmission.signedState
+            )
         )
         let historyManifest = Self.admissionHistoryManifest(
             history,
@@ -1753,6 +2211,27 @@ public actor NoctBoardClient {
                 signedState: groupState.signedState
             ).historyManifest
         )
+        if Self.hasVerifiedPolicyMetadata(
+            board: package.board, signedState: groupState.signedState
+        ) {
+            try await pinReceivedPolicyCheckpoints(board: package.board, at: observedAt)
+            let verifiedState = await (try await messagingClient.openGroupRuntime(
+                groupID: package.board.groupID
+            )).snapshot()
+            let verifiedConfiguration = try Self.boardConfiguration(
+                board: package.board, signedState: verifiedState.signedState
+            )
+            let verifiedEvents = Self.extractBoardEvents(
+                verifiedState.events,
+                board: package.board,
+                signedState: verifiedState.signedState
+            )
+            _ = try NoctBoardVerifiedPolicyV2.project(
+                record: verifiedState, board: package.board,
+                extracted: verifiedEvents.verifiedEvents,
+                configuration: verifiedConfiguration
+            )
+        }
         do {
             try await admissionStateStore.markJoinReceiptVerified(
                 board: package.board,
@@ -1819,6 +2298,11 @@ public actor NoctBoardClient {
             operationID: operationID,
             at: Self.canonicalDate(date)
         )
+        if result.complete {
+            try await pinReceivedPolicyCheckpoints(
+                board: board, at: Self.canonicalDate(date)
+            )
+        }
         return NoctBoardPublicationResumeResult(
             operationID: result.operationID,
             eventID: result.logicalID,
@@ -1841,11 +2325,14 @@ public actor NoctBoardClient {
         logicalClock: UInt64,
         authorSequence: UInt64,
         previousAuthorEventDigest: Data?,
-        localCredential: LocalGroupCredentialV2
+        localCredential: LocalGroupCredentialV2,
+        verifiedPolicy: NoctBoardVerifiedPolicyV2.VerifiedResult?
     ) async throws -> NoctBoardPublishResult {
         let canonicalDate = Self.canonicalDate(createdAt)
         let milliseconds = Int64(canonicalDate.timeIntervalSince1970 * 1_000)
         let event = NoctBoardEvent(
+            schema: verifiedPolicy == nil
+                ? NoctBoardEvent.currentSchema : NoctBoardEvent.verifiedSchema,
             id: eventID,
             clientTransactionID: clientTransactionID,
             boardID: board.boardID,
@@ -1862,9 +2349,14 @@ public actor NoctBoardClient {
             board: board,
             signedState: groupState.signedState
         )
-        let preflight = try NoctBoardProjector.project(
-            events: existingEvents + [event],
-            configuration: configuration
+        let preflight = try verifiedPolicy.map {
+            try NoctBoardProjector.projectVerifiedOrder(
+                events: $0.orderedEvents + [event],
+                configuration: configuration,
+                trustedCheckpointIDs: $0.trustedCheckpointIDs
+            )
+        } ?? NoctBoardProjector.project(
+            events: existingEvents + [event], configuration: configuration
         )
         let candidateDigest = try NoctBoardCodec.digestHex(event)
         guard let verdict = preflight.ledger.entries.last(where: {
@@ -1938,6 +2430,343 @@ public actor NoctBoardClient {
             disposition: NoctBoardPublicationDisposition(publication.disposition),
             projectionDigest: preflight.projectionDigest
         )
+    }
+
+    private static func requirePolicyOwner(_ state: GroupRuntimeRecord) throws {
+        guard state.signedState.members.contains(where: {
+            $0.id == state.localCredential.memberHandle
+                && $0.addedEpoch == 1 && $0.role == .owner
+                && $0.removedEpoch == nil
+        }) else {
+            throw NoctBoardTransportError.verifiedPolicyOwnerRequired
+        }
+    }
+
+    // Core persists a bounded aggregate record at each epoch and application
+    // step. Leave space for the signed epoch, transport journal, direct root,
+    // receipt and durable pin before making the metadata mutation. This is
+    // intentionally conservative; Core remains the final size authority.
+    static func preflightMigrationCapacity(
+        state: GroupRuntimeRecord,
+        root: NoctBoardEvent,
+        maximumDurableBytes: Int = GroupRuntimeRecord.maximumDurableEncodedBytes
+    ) throws {
+        let currentBytes = try NoctweaveCoder.encode(state, sortedKeys: true).count
+        let rootBytes = try NoctBoardCodec.encode(root).count
+        let epochAndJournalReserve = 16 * 1_024 * 1_024
+        guard currentBytes >= 0, rootBytes >= 0,
+              currentBytes <= maximumDurableBytes,
+              epochAndJournalReserve <= maximumDurableBytes - currentBytes,
+              rootBytes <= maximumDurableBytes - currentBytes - epochAndJournalReserve else {
+            throw NoctBoardTransportError.verifiedPolicyCapacityExceeded
+        }
+    }
+
+    private static func policyCheckpointCandidate(
+        board: NoctBoardReference,
+        state: GroupRuntimeRecord,
+        configuration: NoctBoardConfiguration,
+        orderedEvents: [NoctBoardEvent],
+        trustedCheckpointIDs: Set<UUID>,
+        kind: NoctBoardPolicyCheckpointV2.Kind,
+        previousCheckpointDigest: Data?,
+        roleChange: NoctBoardSetRole?,
+        frontiers: [GroupApplicationVerificationFrontierV2],
+        at date: Date,
+        eventID: UUID = UUID(),
+        clientTransactionID: UUID = UUID()
+    ) throws -> (event: NoctBoardEvent, result: NoctBoardProjectionResult) {
+        try requirePolicyOwner(state)
+        guard orderedEvents.count < NoctweaveArchitectureV2.groupEventRecentWindow,
+              frontiers.count == state.signedState.activeCredentials.count,
+              Set(frontiers.map(\.credentialHandle))
+                == Set(state.signedState.activeCredentials.map(\.credentialHandle)),
+              let frontier = frontiers.first,
+              frontiers.allSatisfy({
+                  $0.groupID == board.groupID
+                      && $0.epoch == frontier.epoch
+                      && $0.transcriptHash == frontier.transcriptHash
+              }) else {
+            throw NoctBoardTransportError.verifiedPolicyWindowExceeded
+        }
+        let order = try NoctBoardVerifiedPolicyV2.historyOrder(for: orderedEvents)
+        let historyDigest = try NoctBoardVerifiedPolicyV2.historyDigest(order)
+        let before = try NoctBoardProjector.projectVerifiedOrder(
+            events: orderedEvents,
+            configuration: configuration,
+            trustedCheckpointIDs: trustedCheckpointIDs
+        )
+        let consumed = before.ledger.entries.filter(\.authorChainConsumed)
+        let nextClock: UInt64
+        if let maximum = consumed.map(\.logicalClock).max() {
+            guard maximum < NoctBoardLimits.maximumLogicalInteger else {
+                throw NoctBoardTransportError.logicalClockExhausted
+            }
+            nextClock = maximum + 1
+        } else {
+            nextClock = 0
+        }
+        let owner = state.localCredential.memberHandle
+        let priorOwner = consumed.last { $0.authorMemberHandle == owner }
+        let nextSequence: UInt64
+        let previousAuthorDigest: Data?
+        if let priorOwner {
+            guard priorOwner.authorSequence < NoctBoardLimits.maximumLogicalInteger,
+                  let digest = data(hex: priorOwner.eventDigest) else {
+                throw NoctBoardTransportError.authorSequenceExhausted
+            }
+            nextSequence = priorOwner.authorSequence + 1
+            previousAuthorDigest = digest
+        } else {
+            nextSequence = 0
+            previousAuthorDigest = nil
+        }
+        let checkpoint = NoctBoardPolicyCheckpointV2(
+            kind: kind,
+            owner: owner,
+            groupEpoch: frontier.epoch,
+            groupTranscriptHash: frontier.transcriptHash,
+            previousCheckpointDigest: previousCheckpointDigest,
+            frontiers: frontiers,
+            precedingHistoryDigest: historyDigest,
+            precedingHistoryOrder: order.count <= maximumAdmissionHistoryEvents
+                ? order : nil,
+            roleChange: roleChange
+        )
+        guard checkpoint.isStructurallyValid else {
+            throw NoctBoardTransportError.verifiedPolicyInvalid
+        }
+        let event = NoctBoardEvent(
+            schema: NoctBoardEvent.verifiedSchema,
+            id: eventID,
+            clientTransactionID: clientTransactionID,
+            boardID: board.boardID,
+            groupID: board.groupID,
+            authorMemberHandle: owner,
+            authorCredentialHandle: state.localCredential.credentialHandle,
+            logicalClock: nextClock,
+            authorSequence: nextSequence,
+            previousAuthorEventDigest: previousAuthorDigest,
+            createdAtUnixMilliseconds: Int64(date.timeIntervalSince1970 * 1_000),
+            operation: .policyCheckpointV2(checkpoint)
+        )
+        _ = try NoctBoardCodec.encode(event)
+        let candidateResult = try NoctBoardProjector.projectVerifiedOrder(
+            events: orderedEvents + [event],
+            configuration: configuration,
+            trustedCheckpointIDs: trustedCheckpointIDs.union([event.id])
+        )
+        guard candidateResult.ledger.entries.last?.eventID == event.id,
+              candidateResult.ledger.entries.last?.outcome == .accepted else {
+            throw NoctBoardTransportError.localAuthorizationRejected(
+                candidateResult.ledger.entries.last?.rejectionReason
+            )
+        }
+        return (event, candidateResult)
+    }
+
+    private func publishPolicyCheckpointUnderLease(
+        board: NoctBoardReference,
+        state: GroupRuntimeRecord,
+        configuration: NoctBoardConfiguration,
+        orderedEvents: [NoctBoardEvent],
+        trustedCheckpointIDs: Set<UUID>,
+        kind: NoctBoardPolicyCheckpointV2.Kind,
+        previousCheckpointDigest: Data?,
+        roleChange: NoctBoardSetRole?,
+        at date: Date,
+        eventID: UUID = UUID(),
+        clientTransactionID: UUID = UUID(),
+        additionalRouteSets: NoctBoardRouteSetsTransfer? = nil
+    ) async throws -> NoctBoardPublishResult {
+        guard let frontiers = state.currentVerificationFrontiers(),
+              frontiers.count == state.signedState.activeCredentials.count,
+              state.events.count < NoctweaveArchitectureV2.groupEventRecentWindow,
+              state.protectedApplicationEventIDs.count
+                < GroupRuntimeRecord.maximumProtectedApplicationEvents else {
+            throw NoctBoardTransportError.verifiedPolicyWindowExceeded
+        }
+        let candidate = try Self.policyCheckpointCandidate(
+            board: board, state: state, configuration: configuration,
+            orderedEvents: orderedEvents,
+            trustedCheckpointIDs: trustedCheckpointIDs,
+            kind: kind,
+            previousCheckpointDigest: previousCheckpointDigest,
+            roleChange: roleChange,
+            frontiers: frontiers, at: date,
+            eventID: eventID,
+            clientTransactionID: clientTransactionID
+        )
+        let event = candidate.event
+        let eventBytes = try NoctBoardCodec.encode(event)
+        let signed = NoctBoardSignedEventRecord(
+            eventBytes: eventBytes,
+            authorSignature: try state.localCredential.signingKey.sign(
+                Self.eventSignaturePayload(eventBytes)
+            )
+        )
+        let signedBytes = try NoctweaveCoder.encode(signed, sortedKeys: true)
+        guard signedBytes.count <= NoctBoardSignedEventRecord.maximumEncodedBytes else {
+            throw NoctBoardTransportError.invalidBoardContainer
+        }
+        let content = EncodedContent(
+            type: Self.contentType, parameters: [:], payload: signedBytes,
+            fallbackText: nil, disposition: .silent
+        )
+        guard content.isStructurallyValid else {
+            throw NoctBoardTransportError.invalidBoardContainer
+        }
+        let outer = GroupConversationEventV2(
+            id: event.id,
+            clientTransactionID: event.clientTransactionID,
+            groupID: board.groupID,
+            authorMemberHandle: event.authorMemberHandle,
+            authorCredentialHandle: event.authorCredentialHandle,
+            createdAt: date,
+            kind: .application,
+            content: content,
+            relation: nil
+        )
+        let prepared = try await messagingClient.noctBoardPrepareGroupApplication(
+            outer,
+            additionalRouteSets: additionalRouteSets ?? NoctBoardRouteSetsTransfer([]),
+            at: date
+        )
+        if let operationID = prepared.transportOperationID {
+            let resumed = try await messagingClient.resumeGroupTransport(
+                groupID: board.groupID, operationID: operationID, at: date
+            )
+            guard resumed.complete else {
+                return NoctBoardPublishResult(
+                    event: event, operationID: operationID,
+                    complete: false,
+                    disposition: NoctBoardPublicationDisposition(resumed.disposition),
+                    projectionDigest: candidate.result.projectionDigest
+                )
+            }
+        }
+        let runtime = try await messagingClient.openGroupRuntime(groupID: board.groupID)
+        try await runtime.replaceProtectedApplicationEvent(
+            previousEventID: nil,
+            with: event.id,
+            verificationFrontiers: frontiers
+        )
+        return NoctBoardPublishResult(
+            event: event,
+            operationID: prepared.transportOperationID,
+            complete: true,
+            disposition: .complete,
+            projectionDigest: candidate.result.projectionDigest
+        )
+    }
+
+    /// A received owner checkpoint becomes authority only after its exact
+    /// signed frontier vector has passed Board replay and Core has durably
+    /// retained the corresponding application receipt. Interrupted local
+    /// fanout is resumed using its original encrypted bytes first.
+    package static func checkpointPinOrder(
+        state: GroupRuntimeRecord,
+        extracted: [NoctBoardVerifiedExtractedEventV2]
+    ) -> [UUID] {
+        let owner = state.signedState.members.first {
+            $0.addedEpoch == 1 && $0.role == .owner && $0.removedEpoch == nil
+        }?.id
+        let ownerCredential = state.signedState.memberCredentials.first {
+            $0.memberHandle == owner && $0.removedEpoch == nil
+        }?.credentialHandle
+        return extracted.compactMap { item
+            -> (id: UUID, receipt: GroupApplicationVerificationReceiptV2?)? in
+            guard item.directOuterEventID == item.event.id,
+                  case .policyCheckpointV2 = item.event.operation,
+                  item.event.authorMemberHandle == owner,
+                  item.event.authorCredentialHandle == ownerCredential,
+                  !state.protectedApplicationEventIDs.contains(item.event.id),
+                  !state.retiredProtectedApplicationEventIDs.contains(item.event.id) else {
+                return nil
+            }
+            return (
+                item.event.id,
+                state.applicationVerificationReceipt(for: item.event.id)
+            )
+        }.sorted {
+            if $0.receipt == nil && $1.receipt == nil {
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            guard let left = $0.receipt else { return true }
+            guard let right = $1.receipt else { return false }
+            if left.epoch != right.epoch { return left.epoch < right.epoch }
+            if left.messageCounter != right.messageCounter {
+                return left.messageCounter < right.messageCounter
+            }
+            return $0.id.uuidString < $1.id.uuidString
+        }.map(\.id)
+    }
+
+    private func pinReceivedPolicyCheckpoints(
+        board: NoctBoardReference,
+        at date: Date
+    ) async throws {
+        var runtime = try await messagingClient.openGroupRuntime(groupID: board.groupID)
+        var state = await runtime.snapshot()
+        guard Self.hasVerifiedPolicyMetadata(board: board, signedState: state.signedState) else {
+            return
+        }
+        for _ in 0 ..< GroupRuntimeRecord.maximumProtectedApplicationEvents {
+            let extracted = Self.extractBoardEvents(
+                state.events, board: board, signedState: state.signedState
+            )
+            guard let candidateID = Self.checkpointPinOrder(
+                state: state, extracted: extracted.verifiedEvents
+            ).first else { return }
+            guard let candidate = extracted.verifiedEvents.first(where: {
+                $0.directOuterEventID == candidateID
+            }), case .policyCheckpointV2(let checkpoint) = candidate.event.operation else {
+                throw NoctBoardTransportError.verifiedPolicyInvalid
+            }
+            if state.pendingApplicationPublications.contains(where: {
+                $0.event.id == candidateID
+            }) {
+                guard let operation = state.outboundTransportOperations.first(where: {
+                    $0.kind == .application && $0.logicalID == candidateID
+                }) else {
+                    throw NoctBoardTransportError.publicationIncomplete(.pendingRetry)
+                }
+                let resumed = try await messagingClient.resumeGroupTransport(
+                    groupID: board.groupID, operationID: operation.id, at: date
+                )
+                guard resumed.complete else {
+                    throw NoctBoardTransportError.publicationIncomplete(
+                        NoctBoardPublicationDisposition(resumed.disposition)
+                    )
+                }
+                runtime = try await messagingClient.openGroupRuntime(
+                    groupID: board.groupID
+                )
+                state = await runtime.snapshot()
+            }
+            let configuration = try Self.boardConfiguration(
+                board: board, signedState: state.signedState
+            )
+            let current = Self.extractBoardEvents(
+                state.events, board: board, signedState: state.signedState
+            )
+            _ = try NoctBoardVerifiedPolicyV2.projectForAtomicPin(
+                record: state, board: board,
+                extracted: current.verifiedEvents,
+                configuration: configuration,
+                addingCheckpointID: candidateID
+            )
+            try await runtime.replaceProtectedApplicationEvent(
+                previousEventID: nil,
+                with: candidateID,
+                verificationFrontiers: checkpoint.frontiers
+            )
+            runtime = try await messagingClient.openGroupRuntime(
+                groupID: board.groupID
+            )
+            state = await runtime.snapshot()
+        }
+        throw NoctBoardTransportError.verifiedPolicyWindowExceeded
     }
 
     private func ownerAdmissionJournal(
@@ -2215,6 +3044,11 @@ public actor NoctBoardClient {
             at: journal.createdAt,
             ownerJournal: journal
         )
+        if Self.hasVerifiedPolicyMetadata(board: board, signedState: state.signedState) {
+            try await publishAdmissionPolicyRebindUnderLease(
+                board: board, journal: journal, at: journal.createdAt
+            )
+        }
         journal = journal.compactedComplete(
             packageBytes: packageBytes,
             packageDigest: packageDigest
@@ -2225,6 +3059,66 @@ public actor NoctBoardClient {
             throw NoctBoardTransportError.invalidGroupState
         }
         return package
+    }
+
+    private func publishAdmissionPolicyRebindUnderLease(
+        board: NoctBoardReference,
+        journal: NoctBoardOwnerAdmissionJournal,
+        at date: Date
+    ) async throws {
+        try await pinReceivedPolicyCheckpoints(board: board, at: date)
+        let runtime = try await messagingClient.openGroupRuntime(groupID: board.groupID)
+        let state = await runtime.snapshot()
+        try Self.requirePolicyOwner(state)
+        let configuration = try Self.boardConfiguration(
+            board: board, signedState: state.signedState
+        )
+        let extracted = Self.extractBoardEvents(
+            state.events, board: board, signedState: state.signedState
+        )
+        if let current = try? NoctBoardVerifiedPolicyV2.project(
+            record: state, board: board,
+            extracted: extracted.verifiedEvents,
+            configuration: configuration
+        ), current.latestCheckpoint.groupEpoch == state.signedState.epoch {
+            return
+        }
+        let prior = try NoctBoardVerifiedPolicyV2.projectForOwnerRebind(
+            record: state, board: board,
+            extracted: extracted.verifiedEvents,
+            configuration: configuration
+        )
+        guard prior.orderedEvents.count < Self.maximumAdmissionHistoryEvents else {
+            throw NoctBoardTransportError.verifiedPolicyWindowExceeded
+        }
+        let result = try await publishPolicyCheckpointUnderLease(
+            board: board, state: state, configuration: configuration,
+            orderedEvents: prior.orderedEvents,
+            trustedCheckpointIDs: prior.trustedCheckpointIDs,
+            kind: .snapshot,
+            previousCheckpointDigest: try NoctBoardCodec.digest(
+                prior.latestCheckpointEvent
+            ),
+            roleChange: nil, at: date,
+            additionalRouteSets: Self.admissionTransportRoutes(
+                state: state, journal: journal,
+                initialRouteSet: journal.request.initialRouteSet
+            )
+        )
+        guard result.complete else {
+            throw NoctBoardTransportError.publicationIncomplete(result.disposition)
+        }
+        let refreshed = await (try await messagingClient.openGroupRuntime(
+            groupID: board.groupID
+        )).snapshot()
+        let after = Self.extractBoardEvents(
+            refreshed.events, board: board, signedState: refreshed.signedState
+        )
+        _ = try NoctBoardVerifiedPolicyV2.project(
+            record: refreshed, board: board,
+            extracted: after.verifiedEvents,
+            configuration: configuration
+        )
     }
 
     private func synchronizeAdmissionHistory(
@@ -2492,6 +3386,20 @@ public actor NoctBoardClient {
         }
     }
 
+    private static func admissionTransportRoutes(
+        state: GroupRuntimeRecord,
+        journal: NoctBoardOwnerAdmissionJournal,
+        initialRouteSet: SignedGroupOpaqueRouteSetV2
+    ) -> NoctBoardRouteSetsTransfer {
+        let cached = Set(state.peerRouteCache.entries.map(\.id))
+        let needed = (journal.existingMemberRouteAnnouncements.map(\.routeSet)
+            + [initialRouteSet]).filter {
+                $0.ownerCredentialHandle != state.localCredential.credentialHandle
+                    && !cached.contains($0.ownerCredentialHandle)
+            }
+        return NoctBoardRouteSetsTransfer(needed)
+    }
+
     /// Re-encrypts exact canonical application history into the new epoch.
     /// Late joiners trust the immutable genesis owner's current authenticated
     /// reassertion; they cannot independently reconstruct the original outer
@@ -2568,23 +3476,25 @@ public actor NoctBoardClient {
                    state.pendingApplicationPublications.contains(where: {
                        $0.event.id == groupEventID
                    }) {
-                    let additionalRouteSet = state.peerRouteCache.entries.contains(where: {
-                        $0.id == initialRouteSet.ownerCredentialHandle
-                    }) ? nil : NoctBoardRouteSetTransfer(initialRouteSet)
+                    let additionalRouteSets = Self.admissionTransportRoutes(
+                        state: state, journal: ownerJournal,
+                        initialRouteSet: initialRouteSet
+                    )
                     let prepared = try await messagingClient.noctBoardPrepareGroupApplication(
                         groupEvent,
-                        additionalRouteSet: additionalRouteSet,
+                        additionalRouteSets: additionalRouteSets,
                         at: max(Date(), date)
                     )
                     operationID = prepared.transportOperationID
                 }
             } else {
-                let additionalRouteSet = state.peerRouteCache.entries.contains(where: {
-                    $0.id == initialRouteSet.ownerCredentialHandle
-                }) ? nil : NoctBoardRouteSetTransfer(initialRouteSet)
+                let additionalRouteSets = Self.admissionTransportRoutes(
+                    state: state, journal: ownerJournal,
+                    initialRouteSet: initialRouteSet
+                )
                 let prepared = try await messagingClient.noctBoardPrepareGroupApplication(
                     groupEvent,
-                    additionalRouteSet: additionalRouteSet,
+                    additionalRouteSets: additionalRouteSets,
                     at: max(Date(), date)
                 )
                 operationID = prepared.transportOperationID
@@ -2652,8 +3562,13 @@ public actor NoctBoardClient {
             throw NoctBoardTransportError.admissionVerificationPending
         }
         do {
-            _ = try Self.boardConfiguration(board: board, signedState: state.signedState)
-            try Self.enforceAuditWindow(groupEventCount: state.events.count)
+            let configuration = try Self.boardConfiguration(
+                board: board, signedState: state.signedState
+            )
+            try Self.enforceAuditWindow(
+                groupEventCount: state.events.count,
+                limit: Self.auditWindowLimit(board: board, signedState: state.signedState)
+            )
             let retained = Self.extractBoardEvents(
                 state.events,
                 board: board,
@@ -2663,6 +3578,15 @@ public actor NoctBoardClient {
                 expected: receipt.historyManifest,
                 received: retained.historyManifest
             )
+            if Self.hasVerifiedPolicyMetadata(board: board, signedState: state.signedState) {
+                _ = try NoctBoardVerifiedPolicyV2.project(
+                    record: state, board: board,
+                    extracted: retained.verifiedEvents,
+                    configuration: configuration
+                )
+            } else {
+                try Self.requireLegacyRoleSafety(retained.events)
+            }
         } catch {
             throw NoctBoardTransportError.admissionVerificationPending
         }
@@ -2717,6 +3641,7 @@ public actor NoctBoardClient {
 
     private struct ExtractedEvents {
         let events: [NoctBoardEvent]
+        let verifiedEvents: [NoctBoardVerifiedExtractedEventV2]
         let reassertableEvents: [ReassertableEvent]
         let historyManifest: [NoctBoardAdmissionHistoryManifestEntry]
         let historyBootstrapProvenance: [NoctBoardHistoryBootstrapProvenance]
@@ -2734,6 +3659,7 @@ public actor NoctBoardClient {
         signedState: SignedGroupStateV2
     ) -> ExtractedEvents {
         var events: [NoctBoardEvent] = []
+        var verifiedEvents: [NoctBoardVerifiedExtractedEventV2] = []
         var reassertableEvents: [ReassertableEvent] = []
         var seenEventDigests = Set<Data>()
         var historyManifest: [NoctBoardAdmissionHistoryManifestEntry] = []
@@ -2779,13 +3705,27 @@ public actor NoctBoardClient {
                 ))
                 return nil
             }
+            if signedState.metadataDigest == Self.boardMetadataDigest(
+                boardID: board.boardID
+            ), event.schema == NoctBoardEvent.verifiedSchema,
+               event.authorMemberHandle != genesisOwner?.id {
+                // Before the owner switches metadata and publishes a bound
+                // root, another member cannot force a v2 parser failure that
+                // strands the legacy board or blocks its migration.
+                rejections.append(NoctBoardContainerRejection(
+                    groupEventID: containerID,
+                    reason: .unexpectedContent
+                ))
+                return nil
+            }
             return (event, bytes)
         }
 
         func appendExact(
             _ event: NoctBoardEvent,
             signedRecordBytes: Data,
-            containerID: UUID
+            containerID: UUID,
+            isHistory: Bool
         ) {
             guard let digest = try? NoctBoardCodec.digest(event) else {
                 rejections.append(NoctBoardContainerRejection(
@@ -2794,6 +3734,12 @@ public actor NoctBoardClient {
                 ))
                 return
             }
+            verifiedEvents.append(NoctBoardVerifiedExtractedEventV2(
+                event: event,
+                signedRecordBytes: signedRecordBytes,
+                directOuterEventID: isHistory ? nil : containerID,
+                historyOuterEventID: isHistory ? containerID : nil
+            ))
             if seenEventDigests.insert(digest).inserted {
                 events.append(event)
                 reassertableEvents.append(ReassertableEvent(
@@ -2877,7 +3823,8 @@ public actor NoctBoardClient {
                 appendExact(
                     event,
                     signedRecordBytes: signed.recordBytes,
-                    containerID: groupEvent.id
+                    containerID: groupEvent.id,
+                    isHistory: true
                 )
                 continue
             }
@@ -2913,11 +3860,13 @@ public actor NoctBoardClient {
             appendExact(
                 event,
                 signedRecordBytes: signed.recordBytes,
-                containerID: groupEvent.id
+                containerID: groupEvent.id,
+                isHistory: false
             )
         }
         return ExtractedEvents(
             events: events,
+            verifiedEvents: verifiedEvents,
             reassertableEvents: reassertableEvents,
             historyManifest: historyManifest,
             historyBootstrapProvenance: historyBootstrapProvenance,
@@ -2966,7 +3915,8 @@ public actor NoctBoardClient {
         guard signedState.groupId == board.groupID else {
             throw NoctBoardTransportError.boardBindingMismatch
         }
-        guard signedState.metadataDigest == Self.boardMetadataDigest(boardID: board.boardID) else {
+        guard signedState.metadataDigest == Self.boardMetadataDigest(boardID: board.boardID)
+                || signedState.metadataDigest == Self.verifiedBoardMetadataDigest(boardID: board.boardID) else {
             throw NoctBoardTransportError.invalidGroupState
         }
         guard signedState.members.allSatisfy({ $0.removedEpoch == nil }),
@@ -3037,6 +3987,39 @@ public actor NoctBoardClient {
         )))
     }
 
+    private static func verifiedBoardMetadataDigest(boardID: UUID) -> Data {
+        Data(SHA256.hash(data: Data(
+            "org.noctboard.metadata.v2\0\(boardID.uuidString.lowercased())".utf8
+        )))
+    }
+
+    private static func hasVerifiedPolicyMetadata(
+        board: NoctBoardReference,
+        signedState: SignedGroupStateV2
+    ) -> Bool {
+        signedState.metadataDigest == verifiedBoardMetadataDigest(boardID: board.boardID)
+    }
+
+    private static func requireLegacyRoleSafety(_ events: [NoctBoardEvent]) throws {
+        guard !events.contains(where: {
+            if case .setRole = $0.operation { return true }
+            return false
+        }) else {
+            // Sender clocks cannot authenticate the cross-author cutoff. A
+            // legacy role history needs an owner-reviewed v2 root first.
+            throw NoctBoardTransportError.verifiedPolicyRequired
+        }
+    }
+
+    private static func auditWindowLimit(
+        board: NoctBoardReference,
+        signedState: SignedGroupStateV2
+    ) -> Int {
+        hasVerifiedPolicyMetadata(board: board, signedState: signedState)
+            ? NoctweaveArchitectureV2.groupEventRecentWindow
+            : NoctBoardLimits.maximumBoardEvents
+    }
+
     static func eventSignaturePayload(_ eventBytes: Data) -> Data {
         var payload = Data("org.noctboard.event-signature.v1".utf8)
         payload.append(0)
@@ -3044,20 +4027,21 @@ public actor NoctBoardClient {
         return payload
     }
 
-    /// Noctweave runtime compaction is intentionally unavailable to the v1
-    /// projector because removing sequence-zero or dependency events would
-    /// make a full audit misleading. Count every stored group application
-    /// event, including hostile unexpected-content spam, and fail closed before
-    /// that runtime boundary. An admitted member can force this availability
-    /// failure; recovery requires a future segmented checkpoint format.
+    /// Count every stored group application event, including hostile content,
+    /// and stop before Core's retained-history window. V1 uses its original
+    /// 3,000-event limit; verified v2 reserves the remaining 72 positions for
+    /// a same-board root and subsequent bounded policy traffic.
     static func enforceAuditWindow(
         groupEventCount: Int,
-        reservingNewEvents: Int = 0
+        reservingNewEvents: Int = 0,
+        limit: Int = NoctBoardLimits.maximumBoardEvents
     ) throws {
         guard groupEventCount >= 0,
               reservingNewEvents >= 0,
-              reservingNewEvents <= NoctBoardLimits.maximumBoardEvents,
-              groupEventCount <= NoctBoardLimits.maximumBoardEvents - reservingNewEvents else {
+              limit > 0,
+              limit <= NoctweaveArchitectureV2.groupEventRecentWindow,
+              reservingNewEvents <= limit,
+              groupEventCount <= limit - reservingNewEvents else {
             throw NoctBoardTransportError.boardAuditWindowExceeded
         }
     }
@@ -3124,14 +4108,6 @@ private struct NoctBoardRouteRotationTransfer: Sendable {
 /// Noctweave's immutable route-set graph is not annotated `Sendable`. This
 /// wrapper makes the one-value ownership transfer explicit and keeps the raw
 /// graph inside `HeadlessMessagingClient` actor isolation.
-private struct NoctBoardRouteSetTransfer: @unchecked Sendable {
-    let value: SignedGroupOpaqueRouteSetV2
-
-    init(_ value: SignedGroupOpaqueRouteSetV2) {
-        self.value = value
-    }
-}
-
 private struct NoctBoardRouteSetsTransfer: @unchecked Sendable {
     let values: [SignedGroupOpaqueRouteSetV2]
 
@@ -3191,12 +4167,12 @@ private extension HeadlessMessagingClient {
 
     func noctBoardPrepareGroupApplication(
         _ event: GroupConversationEventV2,
-        additionalRouteSet: NoctBoardRouteSetTransfer?,
+        additionalRouteSets: NoctBoardRouteSetsTransfer,
         at date: Date
     ) async throws -> NoctBoardPreparedApplicationTransfer {
         let prepared = try await prepareGroupApplication(
             event,
-            routeSets: additionalRouteSet.map { [$0.value] } ?? [],
+            routeSets: additionalRouteSets.values,
             at: date
         )
         return NoctBoardPreparedApplicationTransfer(
