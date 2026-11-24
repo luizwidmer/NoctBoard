@@ -955,31 +955,85 @@ private struct ThreadsView: View {
 
 private struct TasksView: View {
     let tasks: [NoctBoardTask]
+    @State private var search = ""
+    @State private var status: NoctBoardTaskState?
 
     var body: some View {
-        List(tasks) { task in
-            HStack(spacing: 14) {
-                Image(systemName: task.state == .completed ? "checkmark.circle.fill" : "circle.dashed")
-                    .font(.title2)
-                    .foregroundStyle(taskColor(task.state))
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(task.title).font(.headline)
-                    if let details = task.details { Text(details).font(.caption).foregroundStyle(.secondary) }
-                    if let assignee = task.assigneeMemberHandle {
-                        Text("Assignee \(shortHandle(assignee.rawValue))").font(.caption.monospaced())
-                    } else {
-                        Text("Unassigned").font(.caption).foregroundStyle(.secondary)
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        let visibleTasks = tasks.filter { task in
+            (status == nil || task.state == status) &&
+                (query.isEmpty || task.title.localizedStandardContains(query) ||
+                    task.details?.localizedStandardContains(query) == true ||
+                    task.assigneeMemberHandle?.rawValue.localizedStandardContains(query) == true)
+        }
+        VStack(spacing: 0) {
+            if !tasks.isEmpty {
+                HStack(spacing: 12) {
+                    HStack(spacing: 7) {
+                        Image(systemName: "magnifyingglass").accessibilityHidden(true)
+                        TextField("Find tasks", text: $search)
+                            .textFieldStyle(.plain)
+                        if !search.isEmpty {
+                            Button("Clear task search", systemImage: "xmark.circle.fill") { search = "" }
+                                .labelStyle(.iconOnly)
+                                .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(8)
+                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+
+                    Picker("Status", selection: $status) {
+                        Text("All statuses").tag(nil as NoctBoardTaskState?)
+                        ForEach(NoctBoardTaskState.allCases, id: \.self) { state in
+                            Text(state.rawValue.capitalized).tag(Optional(state))
+                        }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 12)
+                Divider()
+            }
+            if visibleTasks.isEmpty {
+                ContentUnavailableView {
+                    Label(tasks.isEmpty ? "No tasks yet" : "No matching tasks", systemImage: "checklist")
+                } actions: {
+                    if !tasks.isEmpty {
+                        Button("Clear Filters") { search = ""; status = nil }
                     }
                 }
-                Spacer()
-                Text(task.state.rawValue.capitalized)
-                    .font(.caption.bold())
-                    .padding(.horizontal, 9).padding(.vertical, 5)
-                    .background(taskColor(task.state).opacity(0.14), in: Capsule())
-                    .foregroundStyle(taskColor(task.state))
+                .frame(maxHeight: .infinity)
+            } else {
+                List(visibleTasks) { task in
+                    taskRow(task)
+                }
             }
-            .padding(.vertical, 5)
         }
+    }
+
+    private func taskRow(_ task: NoctBoardTask) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: task.state == .completed ? "checkmark.circle.fill" : "circle.dashed")
+                .font(.title2)
+                .foregroundStyle(taskColor(task.state))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(task.title).font(.headline)
+                if let details = task.details { Text(details).font(.caption).foregroundStyle(.secondary) }
+                if let assignee = task.assigneeMemberHandle {
+                    Text("Assignee \(shortHandle(assignee.rawValue))").font(.caption.monospaced())
+                } else {
+                    Text("Unassigned").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Text(task.state.rawValue.capitalized)
+                .font(.caption.bold())
+                .padding(.horizontal, 9).padding(.vertical, 5)
+                .background(taskColor(task.state).opacity(0.14), in: Capsule())
+                .foregroundStyle(taskColor(task.state))
+        }
+        .padding(.vertical, 5)
     }
 }
 
@@ -1013,15 +1067,19 @@ private struct MembersView: View {
 }
 
 private struct LedgerView: View {
-    private enum Filter: String, CaseIterable { case all = "All", accepted = "Accepted", rejected = "Rejected" }
     let entries: [NoctBoardLedgerEntry]
     let historyBootstrapProvenance: [NoctBoardHistoryBootstrapProvenance]
-    @State private var filter: Filter = .all
+    @State private var filter: NoctBoardLedgerOutcome?
 
     var body: some View {
+        let filtered = entries.filter { filter == nil || $0.outcome == filter }
+        let historyEventIDs = Set(historyBootstrapProvenance.map(\.reassertedEventID))
         VStack(spacing: 0) {
             Picker("Outcome", selection: $filter) {
-                ForEach(Filter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                Text("All").tag(nil as NoctBoardLedgerOutcome?)
+                Text("Accepted").tag(Optional(NoctBoardLedgerOutcome.accepted))
+                Text("Replayed").tag(Optional(NoctBoardLedgerOutcome.replayed))
+                Text("Rejected").tag(Optional(NoctBoardLedgerOutcome.rejected))
             }
             .pickerStyle(.segmented)
             .padding()
@@ -1062,20 +1120,16 @@ private struct LedgerView: View {
                 }
                 .padding(.vertical, 5)
             }
+            .overlay {
+                if filtered.isEmpty {
+                    ContentUnavailableView {
+                        Label(entries.isEmpty ? "No ledger entries yet" : "No entries for this outcome", systemImage: "list.bullet.rectangle")
+                    } actions: {
+                        if !entries.isEmpty { Button("Show All Entries") { filter = nil } }
+                    }
+                }
+            }
         }
-    }
-
-    private var filtered: [NoctBoardLedgerEntry] {
-        switch filter {
-        case .all: entries
-        case .accepted: entries.filter { $0.outcome == .accepted }
-        case .rejected: entries.filter { $0.outcome == .rejected }
-        }
-    }
-
-
-    private var historyEventIDs: Set<UUID> {
-        Set(historyBootstrapProvenance.map(\.reassertedEventID))
     }
 }
 
